@@ -22,7 +22,9 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    # Xcode 27 / iOS 27 SDK: nxnative main uses CMMotionManager.deviceMotionBody
+    # (iOS 27); the macos-26 image tops out at Xcode 26.x and cannot compile it
+    runs-on: xcode-27
     timeout-minutes: 360
 
     steps:
