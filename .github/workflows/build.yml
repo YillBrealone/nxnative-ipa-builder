@@ -87,14 +87,14 @@ jobs:
           download_file() {
             local url="$1"
             local output="$2"
-            local file_id
+            local parsed_info kind target_id
 
             if [[ -z "${url:-}" ]]; then
               echo "::error::A required download URL is empty."
               exit 1
             fi
 
-            file_id="$(python - "$url" <<'PY'
+            parsed_info="$(python - "$url" <<'PY'
           import re
           import sys
           from urllib.parse import urlparse, parse_qs
@@ -103,14 +103,16 @@ jobs:
           parsed = urlparse(url)
           query = parse_qs(parsed.query)
           file_id = None
+          kind = "file"
 
-          if parsed.netloc.lower() in (
-              "drive.google.com",
-              "www.drive.google.com",
-          ):
-              match = re.search(r"/file/d/([^/]+)", parsed.path)
-              if match:
-                  file_id = match.group(1)
+          if "google.com" in parsed.netloc.lower():
+              folder_match = re.search(r"/folders/([^/?#]+)", parsed.path)
+              file_match = re.search(r"/(?:file/d|d)/([^/?#]+)", parsed.path)
+              if folder_match:
+                  file_id = folder_match.group(1)
+                  kind = "folder"
+              elif file_match:
+                  file_id = file_match.group(1)
               elif query.get("id"):
                   file_id = query["id"][0]
 
@@ -121,22 +123,31 @@ jobs:
 
           if not file_id:
               raise SystemExit(
-                  "Could not extract a Google Drive file ID."
+                  "Could not extract a Google Drive file or folder ID."
               )
 
-          print(file_id)
+          print(f"{kind}:{file_id}")
           PY
           )"
 
-            echo "Downloading $(basename "$output")..."
-            gdown "$file_id" -O "$output"
+            kind="${parsed_info%%:*}"
+            target_id="${parsed_info#*:}"
 
-            if [[ ! -s "$output" ]]; then
-              echo "::error::Downloaded file is empty."
-              exit 1
+            echo "Downloading $(basename "$output") ($kind)..."
+            if [[ "$kind" == "folder" ]]; then
+              gdown --folder "$target_id" -O "$output"
+              if [[ ! -d "$output" ]] || [[ -z "$(ls -A "$output" 2>/dev/null)" ]]; then
+                echo "::error::Downloaded Google Drive folder is empty."
+                exit 1
+              fi
+            else
+              gdown "$target_id" -O "$output"
+              if [[ ! -s "$output" ]]; then
+                echo "::error::Downloaded file is empty."
+                exit 1
+              fi
+              file "$output"
             fi
-
-            file "$output"
           }
 
           download_file "$GAME_URL" "$WORK/game.download"
@@ -178,6 +189,8 @@ jobs:
           rar_signatures = (
               b"Rar!\x1a\x07\x00",
               b"Rar!\x1a\x07\x01\x00",
+              b"PK\x03\x04",
+              b"7z\xbc\xaf\x27\x1c",
           )
 
           def validate_package(path):
@@ -219,6 +232,24 @@ jobs:
                   print(f"No {label} download; skipping.")
                   return
 
+              if source.is_dir():
+                  print(f"{label}: folder download detected; scanning packages.")
+                  packages = sorted(
+                      p for p in source.rglob("*")
+                      if p.is_file()
+                      and not p.name.startswith("._")
+                      and "__MACOSX" not in p.parts
+                      and p.suffix.lower() in package_extensions
+                  )
+                  if not packages:
+                      raise SystemExit(
+                          f"No NSP/XCI/NSZ/XCZ packages found "
+                          f"in the {label} folder."
+                      )
+                  for package in packages:
+                      add_package(package, label)
+                  return
+
               with source.open("rb") as f:
                   signature = f.read(8)
 
@@ -246,6 +277,8 @@ jobs:
                   packages = sorted(
                       p for p in extract_dir.rglob("*")
                       if p.is_file()
+                      and not p.name.startswith("._")
+                      and "__MACOSX" not in p.parts
                       and p.suffix.lower() in package_extensions
                   )
 
