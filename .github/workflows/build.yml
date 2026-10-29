@@ -414,23 +414,33 @@ jobs:
           echo "Shader profile ID: $PROFILE_ID"
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
- 
-      - name: Update shader toolchain lock and header
+       - name: Update shader toolchain lock and header
         shell: bash
         run: |
           set -euo pipefail
           echo "Preparing shader toolchain for profile $DM_GAME"
- 
+
           CHAIN_SCRIPT="$(
             find . -name dmsh_chain.py -type f -print -quit
           )"
- 
+          LOCK_SCRIPT="$(
+            find . -name tool_lock.py -type f -print -quit
+          )"
+
           if [[ -z "$CHAIN_SCRIPT" ]]; then
             echo "::error::Could not find dmsh_chain.py"
             exit 1
           fi
- 
-          python "$CHAIN_SCRIPT" --update-lock
+
+          # Newer nxnative (standard repo) moved lock handling into
+          # tool_lock.py; the pinned BC fallback revision still handles
+          # it inside dmsh_chain.py itself.
+          if [[ -n "$LOCK_SCRIPT" ]]; then
+            python "$LOCK_SCRIPT" --update-lock
+          else
+            python "$CHAIN_SCRIPT" --update-lock
+          fi
+
           python "$CHAIN_SCRIPT" --header
  
       - name: Build unsigned IPA
