@@ -415,23 +415,21 @@ jobs:
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
  
-      - name: Update shader toolchain lock and header
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Preparing shader toolchain for profile $DM_GAME"
- 
-          CHAIN_SCRIPT="$(
-            find . -name dmsh_chain.py -type f -print -quit
-          )"
- 
-          if [[ -z "$CHAIN_SCRIPT" ]]; then
-            echo "::error::Could not find dmsh_chain.py"
-            exit 1
-          fi
- 
-          python "$CHAIN_SCRIPT" --update-lock
-          python "$CHAIN_SCRIPT" --header
+       - name: Update shader toolchain lock and header
+    run: |
+      set -euo pipefail
+      echo "Preparing shader toolchain for profile $DM_GAME"
+
+      CHAIN_SCRIPT="$(find . -name dmsh_chain.py -type f -print -quit)"
+      LOCK_SCRIPT="$(find . -name tool_lock.py -type f -print -quit)"
+
+      if [[ -z "$CHAIN_SCRIPT" || -z "$LOCK_SCRIPT" ]]; then
+        echo "::error::Could not find dmsh_chain.py / tool_lock.py"
+        exit 1
+      fi
+
+      python "$LOCK_SCRIPT" --update-lock
+      python "$CHAIN_SCRIPT" --header
  
       - name: Build unsigned IPA
         shell: bash
