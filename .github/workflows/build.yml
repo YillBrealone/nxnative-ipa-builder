@@ -54,10 +54,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          brew install xcodegen zstd spirv-cross unar
+          brew install xcodegen zstd spirv-cross unar glslang
           python -m pip install --upgrade pip
           python -m pip install \
             lz4 capstone fonttools backports.zstd gdown
+
+          # Xcode 26 (macos-26 runners) ships the Metal shader compiler
+          # as a separate on-demand component; the build script requires
+          # `xcrun -sdk iphoneos metal` to work.
+          if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
+            echo "Metal toolchain not installed; downloading it..."
+            xcodebuild -runFirstLaunch || true
+            xcodebuild -downloadComponent MetalToolchain \
+              || sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -sdk iphoneos metal --version | head -1
 
       - name: Download game files and keys
         env:
@@ -442,7 +453,7 @@ jobs:
           fi
 
           python "$CHAIN_SCRIPT" --header
-          
+
       - name: Build unsigned IPA
         shell: bash
         run: |
