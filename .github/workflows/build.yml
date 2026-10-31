@@ -167,6 +167,11 @@ jobs:
             kind="${parsed_info%%:*}"
             target_id="${parsed_info#*:}"
 
+            # Mask both the raw URL and the extracted Google Drive ID so gdown
+            # never exposes your prod.keys or game links in public Actions logs.
+            echo "::add-mask::$url"
+            echo "::add-mask::$target_id"
+
             echo "Downloading $(basename "$output") ($kind)..."
             if [[ "$kind" == "folder" ]]; then
               gdown --folder "$target_id" -O "$output"
