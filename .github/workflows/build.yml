@@ -11,6 +11,21 @@ on:
         options:
           - "iPhone 15 or older (BC fallback)"
           - "iPhone 15 Pro/Pro Max or newer (standard)"
+      game_url:
+        description: "Base Game Google Drive link (leave blank to use Game_URL secret)"
+        required: false
+        type: string
+        default: ""
+      update_url:
+        description: "Update Google Drive link (optional; leave blank if none)"
+        required: false
+        type: string
+        default: ""
+      dlc_url:
+        description: "DLC Google Drive file or folder link (optional; leave blank if none)"
+        required: false
+        type: string
+        default: ""
       profile_id:
         description: "Optional nxnative profile ID override (leave blank for automatic detection)"
         required: false
@@ -47,7 +62,7 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Set up .NET SDK
+      - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
@@ -56,12 +71,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          brew update
           brew install xcodegen zstd spirv-cross unar glslang
           python -m pip install --upgrade pip
           python -m pip install \
-            lz4 capstone fonttools backports.zstd gdown
+            lz4 capstone fonttools backports.zstd gdown nsz
 
-          # Xcode 26 (macos-26 runners) ships the Metal shader compiler
+          # Xcode 26/27 runners ship the Metal shader compiler
           # as a separate on-demand component; the build script requires
           # `xcrun -sdk iphoneos metal` to work.
           if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
@@ -74,9 +90,12 @@ jobs:
 
       - name: Download game files and keys
         env:
-          GAME_URL: ${{ secrets.Game_URL }}
-          UPDATE_URL: ${{ secrets.Update_URL }}
-          DLC_URL: ${{ secrets.DLC_URL }}
+          INPUT_GAME_URL: ${{ inputs.game_url }}
+          INPUT_UPDATE_URL: ${{ inputs.update_url }}
+          INPUT_DLC_URL: ${{ inputs.dlc_url }}
+          SECRET_GAME_URL: ${{ secrets.Game_URL }}
+          SECRET_UPDATE_URL: ${{ secrets.Update_URL }}
+          SECRET_DLC_URL: ${{ secrets.DLC_URL }}
           KEYS_URL: ${{ secrets.Keys_URL }}
         shell: bash
         run: |
@@ -84,12 +103,27 @@ jobs:
           WORK="$RUNNER_TEMP/nxnative"
           mkdir -p "$WORK"
 
+          # If game_url is provided in the "Run workflow" popup, use the popup
+          # inputs for game/update/dlc so old Update_URL or DLC_URL secrets from
+          # a previous game do not get mixed in. Otherwise fall back to secrets.
+          if [[ -n "${INPUT_GAME_URL// /}" ]]; then
+            echo "Using game links from Run workflow popup inputs."
+            GAME_URL="$INPUT_GAME_URL"
+            UPDATE_URL="${INPUT_UPDATE_URL:-}"
+            DLC_URL="${INPUT_DLC_URL:-}"
+          else
+            echo "Using game links from repository secrets."
+            GAME_URL="${SECRET_GAME_URL:-}"
+            UPDATE_URL="${INPUT_UPDATE_URL:-${SECRET_UPDATE_URL:-}}"
+            DLC_URL="${INPUT_DLC_URL:-${SECRET_DLC_URL:-}}"
+          fi
+
           download_file() {
             local url="$1"
             local output="$2"
             local parsed_info kind target_id
 
-            if [[ -z "${url:-}" ]]; then
+            if [[ -z "${url// /}" ]]; then
               echo "::error::A required download URL is empty."
               exit 1
             fi
@@ -153,13 +187,13 @@ jobs:
           download_file "$GAME_URL" "$WORK/game.download"
           download_file "$KEYS_URL" "$WORK/prod.keys"
 
-          if [[ -n "${UPDATE_URL:-}" ]]; then
+          if [[ -n "${UPDATE_URL// /}" ]]; then
             download_file "$UPDATE_URL" "$WORK/update.download"
           else
             echo "No UPDATE_URL configured; continuing without an update."
           fi
 
-          if [[ -n "${DLC_URL:-}" ]]; then
+          if [[ -n "${DLC_URL// /}" ]]; then
             download_file "$DLC_URL" "$WORK/dlc.download"
           else
             echo "No DLC_URL configured; continuing without DLC."
@@ -177,34 +211,78 @@ jobs:
 
           python - "$WORK" "$GAME_DIR" <<'PY'
           import shutil
+          import struct
           import subprocess
           import sys
           from pathlib import Path
 
           work = Path(sys.argv[1])
           game_dir = Path(sys.argv[2])
+          keys_path = work / "prod.keys"
           package_extensions = {
               ".nsp", ".xci", ".nsz", ".xcz"
           }
-          rar_signatures = (
+          archive_signatures = (
               b"Rar!\x1a\x07\x00",
               b"Rar!\x1a\x07\x01\x00",
               b"PK\x03\x04",
               b"7z\xbc\xaf\x27\x1c",
           )
 
+          def pfs0_entries(path):
+              try:
+                  with path.open("rb") as f:
+                      header = f.read(16)
+                      if len(header) != 16 or header[:4] != b"PFS0":
+                          return []
+                      count, string_size = struct.unpack_from("<II", header, 4)
+                      if count > 100000 or string_size > 100000000:
+                          return []
+                      entries = f.read(count * 0x18)
+                      strings = f.read(string_size)
+                      if len(entries) != count * 0x18:
+                          return []
+                      names = []
+                      for i in range(count):
+                          offset = struct.unpack_from("<I", entries, i * 0x18 + 0x10)[0]
+                          if offset >= len(strings):
+                              continue
+                          end = strings.find(b"\0", offset)
+                          if end < 0:
+                              continue
+                          names.append(strings[offset:end].decode(errors="replace"))
+                      return names
+              except (OSError, struct.error):
+                  return []
+
+          def detect_package_extension(path):
+              with path.open("rb") as f:
+                  header = f.read(0x104)
+              if header[:4] == b"PFS0":
+                  names = [n.lower() for n in pfs0_entries(path)]
+                  if any(n.endswith(".ncz") for n in names):
+                      return ".nsz"
+                  return ".nsp"
+              if len(header) >= 0x104 and header[0x100:0x104] == b"HEAD":
+                  if path.suffix.lower() == ".xcz":
+                      return ".xcz"
+                  return ".xci"
+              return None
+
           def validate_package(path):
               with path.open("rb") as f:
-                  magic = f.read(4)
+                  header = f.read(0x104)
 
               suffix = path.suffix.lower()
 
-              if suffix in (".nsp", ".nsz") and magic != b"PFS0":
+              if suffix in (".nsp", ".nsz") and header[:4] != b"PFS0":
                   raise SystemExit(
                       f"Invalid {suffix} package signature: {path.name}"
                   )
 
-              if suffix in (".xci", ".xcz") and magic != b"HEAD":
+              if suffix in (".xci", ".xcz") and (
+                  len(header) < 0x104 or header[0x100:0x104] != b"HEAD"
+              ):
                   raise SystemExit(
                       f"Invalid {suffix} package signature: {path.name}"
                   )
@@ -213,9 +291,7 @@ jobs:
               target = game_dir / source.name
 
               if target.exists():
-                  raise SystemExit(
-                      "Duplicate package filename: " + source.name
-                  )
+                  target = game_dir / f"{label}_{source.name}"
 
               validate_package(source)
               shutil.copy2(source, target)
@@ -224,6 +300,28 @@ jobs:
                   f"Added {label}: {target.name} "
                   f"({target.stat().st_size:,} bytes)"
               )
+
+          def extract_and_add(archive_path, label):
+              extract_dir = work / f"extracted-{label}-{archive_path.stem}"
+              extract_dir.mkdir(parents=True, exist_ok=True)
+              print(f"{label}: archive detected ({archive_path.name}); extracting.")
+              subprocess.run(
+                  ["unar", "-o", str(extract_dir), str(archive_path)],
+                  check=True,
+              )
+              packages = sorted(
+                  p for p in extract_dir.rglob("*")
+                  if p.is_file()
+                  and not p.name.startswith("._")
+                  and "__MACOSX" not in p.parts
+                  and p.suffix.lower() in package_extensions
+              )
+              if not packages:
+                  raise SystemExit(
+                      f"No NSP/XCI/NSZ/XCZ packages found in {label} archive."
+                  )
+              for package in packages:
+                  add_package(package, label)
 
           def process_download(label):
               source = work / f"{label}.download"
@@ -234,78 +332,45 @@ jobs:
 
               if source.is_dir():
                   print(f"{label}: folder download detected; scanning packages.")
-                  packages = sorted(
-                      p for p in source.rglob("*")
-                      if p.is_file()
-                      and not p.name.startswith("._")
-                      and "__MACOSX" not in p.parts
-                      and p.suffix.lower() in package_extensions
-                  )
-                  if not packages:
+                  found_any = False
+                  for item in sorted(source.rglob("*")):
+                      if not item.is_file() or item.name.startswith("._") or "__MACOSX" in item.parts:
+                          continue
+                      with item.open("rb") as f:
+                          sig = f.read(8)
+                      if any(sig.startswith(m) for m in archive_signatures):
+                          extract_and_add(item, label)
+                          found_any = True
+                      elif item.suffix.lower() in package_extensions:
+                          add_package(item, label)
+                          found_any = True
+                  if not found_any:
                       raise SystemExit(
-                          f"No NSP/XCI/NSZ/XCZ packages found "
-                          f"in the {label} folder."
+                          f"No NSP/XCI/NSZ/XCZ packages found in {label} folder."
                       )
-                  for package in packages:
-                      add_package(package, label)
                   return
 
               with source.open("rb") as f:
                   signature = f.read(8)
 
-              is_rar = any(
+              is_archive = any(
                   signature.startswith(magic)
-                  for magic in rar_signatures
+                  for magic in archive_signatures
               )
 
-              if is_rar:
-                  extract_dir = work / f"extracted-{label}"
-                  extract_dir.mkdir(parents=True, exist_ok=True)
-
-                  print(f"{label}: RAR archive detected; extracting.")
-
-                  subprocess.run(
-                      [
-                          "unar",
-                          "-o",
-                          str(extract_dir),
-                          str(source),
-                      ],
-                      check=True,
-                  )
-
-                  packages = sorted(
-                      p for p in extract_dir.rglob("*")
-                      if p.is_file()
-                      and not p.name.startswith("._")
-                      and "__MACOSX" not in p.parts
-                      and p.suffix.lower() in package_extensions
-                  )
-
-                  if not packages:
-                      raise SystemExit(
-                          f"No NSP/XCI/NSZ/XCZ packages found "
-                          f"in the {label} RAR archive."
-                      )
-
-                  for package in packages:
-                      add_package(package, label)
-
+              if is_archive:
+                  extract_and_add(source, label)
               else:
                   print(
-                      f"{label}: not a RAR archive; "
+                      f"{label}: not an archive; "
                       "checking as a direct package."
                   )
 
-                  if signature[:4] == b"PFS0":
-                      extension = ".nsp"
-                  elif signature[:4] == b"HEAD":
-                      extension = ".xci"
-                  else:
+                  extension = detect_package_extension(source)
+                  if not extension:
                       raise SystemExit(
-                          f"{label} is not a recognized RAR archive "
-                          "or direct NSP/XCI package. "
-                          "Direct downloads must be NSP or XCI files."
+                          f"{label} is not a recognized RAR/ZIP/7Z archive "
+                          "or direct NSP/XCI/NSZ/XCZ package."
                       )
 
                   target = game_dir / f"{label}{extension}"
@@ -326,6 +391,36 @@ jobs:
           process_download("game")
           process_download("update")
           process_download("dlc")
+
+          # Decompress any .nsz or .xcz packages to .nsp / .xci so both
+          # standard and BC-fallback builds work seamlessly with NSZ/XCZ.
+          compressed = sorted(
+              p for p in game_dir.iterdir()
+              if p.is_file() and p.suffix.lower() in (".nsz", ".xcz")
+          )
+          if compressed:
+              nsz_tmp = work / "nsz_tmp"
+              nsz_tmp.mkdir(parents=True, exist_ok=True)
+              keys_link = nsz_tmp / "keys.txt"
+              if not keys_link.exists():
+                  keys_link.symlink_to(keys_path.resolve())
+              for pkg in compressed:
+                  out_ext = ".nsp" if pkg.suffix.lower() == ".nsz" else ".xci"
+                  print(f"Decompressing {pkg.name} -> {pkg.stem}{out_ext} ...")
+                  subprocess.run(
+                      [
+                          sys.executable,
+                          "-c",
+                          "import sys; sys.argv[0]='nsz'; from nsz import main; main()",
+                          "-D",
+                          "-o",
+                          str(game_dir),
+                          str(pkg.resolve()),
+                      ],
+                      cwd=str(nsz_tmp),
+                      check=True,
+                  )
+                  pkg.unlink()
 
           packages = sorted(
               p for p in game_dir.iterdir()
@@ -447,15 +542,19 @@ jobs:
           PY
           )"
 
-          PROFILE_ID="${PROFILE_OVERRIDE:-$DETECTED_ID}"
-          PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
+          echo "Detected base title ID: $DETECTED_ID"
 
-          if [[ ! "$PROFILE_ID" =~ ^[0-9A-F]{16}$ ]]; then
-            echo "::error::Profile ID must be exactly 16 hexadecimal characters."
-            exit 1
+          if [[ -n "${PROFILE_OVERRIDE:-}" ]]; then
+            PROFILE_ID="$(echo "$PROFILE_OVERRIDE" | tr '[:lower:]' '[:upper:]')"
+            echo "Using manual profile override: $PROFILE_ID"
+          elif [[ -d "dm/games/$DETECTED_ID" ]]; then
+            PROFILE_ID="$DETECTED_ID"
+            echo "Found matching profile directory: dm/games/$PROFILE_ID"
+          else
+            PROFILE_ID="DEFAULT"
+            echo "No profile directory for $DETECTED_ID; falling back to DEFAULT."
           fi
 
-          echo "Detected base title ID: $DETECTED_ID"
           echo "Shader profile ID: $PROFILE_ID"
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
@@ -510,8 +609,48 @@ jobs:
           echo "IPA successfully created: $OUTPUT"
           ls -lh "$OUTPUT"
 
+      - name: Publish direct IPA download link
+        if: success()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUTPUT="$RUNNER_TEMP/NxNative.ipa"
+          IPA_SIZE="$(ls -lh "$OUTPUT" | awk '{print $5}')"
+
+          echo "Uploading NxNative.ipa ($IPA_SIZE) to Gofile for direct iPhone download..."
+          RESPONSE="$(curl -sS --retry 3 -F "file=@$OUTPUT" https://upload.gofile.io/uploadfile)"
+
+          DOWNLOAD_URL="$(python - "$RESPONSE" <<'PY'
+          import json, sys
+          try:
+              data = json.loads(sys.argv[1])
+              if data.get("status") == "ok":
+                  print(data["data"]["downloadPage"])
+          except Exception:
+              pass
+          PY
+          )"
+
+          if [[ -n "$DOWNLOAD_URL" ]]; then
+            echo "=========================================="
+            echo "DIRECT IPA DOWNLOAD LINK: $DOWNLOAD_URL"
+            echo "=========================================="
+            {
+              echo "## 📱 Direct iPhone Download (No Unzip Needed)"
+              echo "- **Game Title ID:** \`$DETECTED_TITLE_ID\`"
+              echo "- **IPA Size:** \`$IPA_SIZE\`"
+              echo "- **👉 [Tap here to download NxNative.ipa directly]($DOWNLOAD_URL)**"
+              echo ""
+              echo "_Tip: Open that link to download \`NxNative.ipa\` directly without needing to unzip a GitHub artifact._"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Could not generate Gofile link; use the GitHub Artifact below instead."
+          fi
+
       - name: Upload IPA
         if: success()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: NxNative-IPA-${{ inputs.device == 'iPhone 15 or older (BC fallback)' && 'BC-Fallback' || 'Standard' }}
