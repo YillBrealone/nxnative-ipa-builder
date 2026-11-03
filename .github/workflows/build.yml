@@ -7,10 +7,10 @@ on:
         description: "Choose the target device and texture support path"
         required: true
         type: choice
-        default: "iPhone 15 or older (BC fallback)"
+        default: "iPhone 15 Pro/Pro Max or newer (standard)"
         options:
-          - "iPhone 15 or older (BC fallback)"
           - "iPhone 15 Pro/Pro Max or newer (standard)"
+          - "iPhone 15 or older (BC fallback)"
       game_url:
         description: "Base Game Google Drive link (leave blank to use Game_URL secret)"
         required: false
