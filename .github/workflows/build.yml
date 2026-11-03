@@ -179,13 +179,22 @@ jobs:
                 echo "::error::Downloaded Google Drive folder is empty."
                 exit 1
               fi
-            else
+            elif [[ "$(basename "$output")" == "prod.keys" ]]; then
               gdown "$target_id" -O "$output"
               if [[ ! -s "$output" ]]; then
-                echo "::error::Downloaded file is empty."
+                echo "::error::Downloaded prod.keys file is empty."
                 exit 1
               fi
-              file "$output"
+            else
+              # Download into a directory (-O "$output/") so gdown preserves the
+              # original Google Drive filename (including [TitleID] and [vVersion]
+              # tags required by standard-crypto / ticketless NSPs and updates).
+              mkdir -p "$output"
+              gdown "$target_id" -O "$output/"
+              if [[ -z "$(ls -A "$output" 2>/dev/null)" ]]; then
+                echo "::error::Downloaded file directory is empty."
+                exit 1
+              fi
             fi
           }
 
@@ -336,7 +345,7 @@ jobs:
                   return
 
               if source.is_dir():
-                  print(f"{label}: folder download detected; scanning packages.")
+                  print(f"{label}: scanning downloaded files.")
                   found_any = False
                   for item in sorted(source.rglob("*")):
                       if not item.is_file() or item.name.startswith("._") or "__MACOSX" in item.parts:
@@ -349,9 +358,16 @@ jobs:
                       elif item.suffix.lower() in package_extensions:
                           add_package(item, label)
                           found_any = True
+                      else:
+                          ext = detect_package_extension(item)
+                          if ext:
+                              renamed = item.with_name(f"{item.name}{ext}")
+                              item.rename(renamed)
+                              add_package(renamed, label)
+                              found_any = True
                   if not found_any:
                       raise SystemExit(
-                          f"No NSP/XCI/NSZ/XCZ packages found in {label} folder."
+                          f"No NSP/XCI/NSZ/XCZ packages found in {label} download."
                       )
                   return
 
@@ -426,6 +442,76 @@ jobs:
                       check=True,
                   )
                   pkg.unlink()
+
+          # Ensure every prepared package has either a .tik inside or a [TitleID]
+          # tag in its filename so ticketless (standard-crypto) NSPs and XCIs work
+          # across both standard and BC-fallback nxnative versions even when the
+          # original filename did not include [0100...].
+          import re
+          header_key_hex = None
+          if keys_path.is_file():
+              for line in keys_path.read_text(errors="replace").splitlines():
+                  m = re.match(r"^\s*header_key\s*=\s*([0-9A-Fa-f]{64})\s*$", line)
+                  if m:
+                      header_key_hex = m.group(1)
+                      break
+
+          def probe_nca_title_id(pkg_path):
+              if not header_key_hex:
+                  return None
+              try:
+                  from nsz.nut import aes128
+                  xts_key = bytes.fromhex(header_key_hex)
+                  with pkg_path.open("rb") as f:
+                      h = f.read(16)
+                      if len(h) != 16 or h[:4] != b"PFS0":
+                          return None
+                      count, str_size = struct.unpack_from("<II", h, 4)
+                      entries = f.read(count * 0x18)
+                      strings = f.read(str_size)
+                      data_base = 16 + count * 0x18 + str_size
+                      meta_tids, other_tids = [], []
+                      for i in range(count):
+                          d_off, d_sz, s_off = struct.unpack_from("<QQI", entries, i * 0x18)
+                          end = strings.find(b"\0", s_off)
+                          name = strings[s_off:end].decode(errors="replace") if end >= 0 else ""
+                          if not name.lower().endswith(".nca") or d_sz < 0x400:
+                              continue
+                          f.seek(data_base + d_off + 0x200)
+                          sec1 = f.read(0x200)
+                          if len(sec1) != 0x200:
+                              continue
+                          dec = aes128.AESXTS(xts_key, sector=1).decrypt(sec1)
+                          if dec[:4] in (b"NCA3", b"NCA2"):
+                              ctype = dec[0x05]
+                              tid = struct.unpack_from("<Q", dec, 0x10)[0]
+                              if ctype == 1:
+                                  meta_tids.append(tid)
+                              else:
+                                  other_tids.append(tid)
+                      if meta_tids:
+                          return min(meta_tids)
+                      if other_tids:
+                          return min(other_tids)
+              except Exception as exc:
+                  print(f"Warning: NCA header title ID probe failed for {pkg_path.name}: {exc}")
+              return None
+
+          for pkg in sorted(game_dir.iterdir()):
+              if not pkg.is_file() or pkg.suffix.lower() not in package_extensions:
+                  continue
+              has_tik = any(
+                  re.fullmatch(r"[0-9A-Fa-f]{32}\.tik", n)
+                  for n in pfs0_entries(pkg)
+              )
+              has_tag = bool(re.search(r"\[[0-9A-Fa-f]{16}\]", pkg.name))
+              if not has_tik and not has_tag:
+                  tid = probe_nca_title_id(pkg)
+                  if tid is not None:
+                      new_name = f"{pkg.stem} [{tid:016X}]{pkg.suffix}"
+                      new_path = pkg.with_name(new_name)
+                      pkg.rename(new_path)
+                      print(f"Tagged ticketless package with NCA Title ID: {new_path.name}")
 
           packages = sorted(
               p for p in game_dir.iterdir()
