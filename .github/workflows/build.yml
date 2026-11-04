@@ -650,6 +650,57 @@ jobs:
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
 
+      - name: Apply Mario + Rabbids Kingdom Battle 4-DLC memory and texture fixes
+        if: env.DETECTED_TITLE_ID == '010067300059A000'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Applying Snowdrop 4-DLC slab pool and CPU-streamed texture fixes for 010067300059A000..."
+          python - <<'PY'
+          from pathlib import Path
+
+          # 1. Expand Snowdrop's 512 KB and 64 KB slab pools from 512 MB each to 768 MB each
+          # (3.5 GB total reservation instead of 3.0 GB) so mounting all 4 DLCs does not
+          # exhaust the 64 KB slab pool (+3.00 GB / 0x70D0000000) at Peach's Castle.
+          patches_py = Path("dm/games/010067300059A000/patches.py")
+          if patches_py.exists():
+              text = patches_py.read_text(encoding="utf-8")
+              text = text.replace(
+                  "(0xea2190, 'e80360b2', '0800a4d2',",
+                  "(0xea2190, 'e80360b2', '0800a6d2',",
+              ).replace(
+                  "(0xea21c0, 'f60760b2', '1600b8d2',",
+                  "(0xea21c0, 'f60760b2', '1600bcd2',",
+              ).replace(
+                  "(0xea21cc, 'e00760b2', '0000b8d2',",
+                  "(0xea21cc, 'e00760b2', '0000bcd2',",
+              )
+              patches_py.write_text(text, encoding="utf-8")
+              print("Updated dm/games/010067300059A000/patches.py (768 MB slabs / 3.5 GB range)")
+
+          # 2. Enable tex_flush_upload and tex_dirty_upload in game.tsv so textures written
+          # or flushed by the CPU after initialization re-upload when their pool pages change.
+          game_tsv = Path("dm/games/010067300059A000/game.tsv")
+          if game_tsv.exists():
+              tsv = game_tsv.read_text(encoding="utf-8")
+              if "tex_flush_upload\t" not in tsv:
+                  tsv = tsv.rstrip("\n") + "\ntex_flush_upload\ton\ntex_dirty_upload\ton\n"
+                  game_tsv.write_text(tsv, encoding="utf-8")
+                  print("Enabled tex_flush_upload and tex_dirty_upload in dm/games/010067300059A000/game.tsv")
+
+          # 3. Allow uncompressed flags==0 textures in CPU-writable pools (Snowdrop's 1024x32x1
+          # color-grading LUTs, 128x128x6 cubemaps, 32x16x384 probe arrays, and 128x1x1 sky LUTs)
+          # to go through NvPkg (tex_cpu_content) instead of returning stale/zero textures from g_alias.
+          nvn_mtl = Path("dm/gfx/nvn/nvn_mtl.m")
+          if nvn_mtl.exists():
+              src = nvn_mtl.read_text(encoding="utf-8")
+              old = "!(fmt_compressed(t->d.format) || t->d.target == NVN_TEXTURE_TARGET_3D)"
+              new = "!(fmt_compressed(t->d.format) || t->d.target == NVN_TEXTURE_TARGET_3D || !t->d.flags)"
+              if old in src:
+                  nvn_mtl.write_text(src.replace(old, new, 1), encoding="utf-8")
+                  print("Updated tex_cpu_content in dm/gfx/nvn/nvn_mtl.m for uncompressed CPU-streamed textures")
+          PY
+
       - name: Update shader toolchain lock and header
         shell: bash
         run: |
