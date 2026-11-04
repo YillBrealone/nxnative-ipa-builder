@@ -714,14 +714,32 @@ jobs:
           # 3. Allow uncompressed flags==0 textures in CPU-writable pools (Snowdrop's 1024x32x1
           # color-grading LUTs, 128x128x6 cubemaps, 32x16x384 probe arrays, and 128x1x1 sky LUTs)
           # to go through NvPkg (tex_cpu_content) instead of returning stale/zero textures from g_alias.
+          # Also allow Quick-Patch DmIOS binaries to fall back to an existing msl/b-* shader folder
+          # in the installed .app bundle when upstream bumps DMSH_CHAIN between builds.
           nvn_mtl = Path("dm/gfx/nvn/nvn_mtl.m")
           if nvn_mtl.exists():
               src = nvn_mtl.read_text(encoding="utf-8")
               old = "!(fmt_compressed(t->d.format) || t->d.target == NVN_TEXTURE_TARGET_3D)"
               new = "!(fmt_compressed(t->d.format) || t->d.target == NVN_TEXTURE_TARGET_3D || !t->d.flags)"
               if old in src:
-                  nvn_mtl.write_text(src.replace(old, new, 1), encoding="utf-8")
+                  src = src.replace(old, new, 1)
                   print("Updated tex_cpu_content in dm/gfx/nvn/nvn_mtl.m for uncompressed CPU-streamed textures")
+              old_dir = 'if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir]) MLOG("[RED] shader library directory %s does not exist:'
+              new_dir = (
+                  'if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir] && m) { '
+                  'for (NSString *sub in [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(m) error:nil]) '
+                  'if ([sub hasPrefix:@"b-"]) { g_msl_dir = [@(m) stringByAppendingPathComponent:sub]; break; } }\n    '
+                  + old_dir
+              )
+              if old_dir in src:
+                  src = src.replace(old_dir, new_dir, 1)
+                  src = src.replace('if (!head || ![head hasPrefix:want])', 'if (!head || (![head hasPrefix:want] && ![head hasPrefix:@"# chain b-"]))', 1)
+                  src = src.replace('if (!xh || ![xh hasPrefix:want])', 'if (!xh || (![xh hasPrefix:want] && ![xh hasPrefix:@"# chain b-"]))', 1)
+                  src = src.replace('![vj[@"chain"] isEqual:@DMSH_CHAIN] || ![fj[@"chain"] isEqual:@DMSH_CHAIN]', '!vj[@"chain"] || !fj[@"chain"]', 1)
+                  src = src.replace('![j[@"chain"] isEqual:@DMSH_CHAIN]', '!j[@"chain"]')
+                  src = src.replace('[j[@"chain"] isEqual:@DMSH_CHAIN]', '(j[@"chain"] != nil)')
+                  print("Updated dm/gfx/nvn/nvn_mtl.m to accept existing msl/b-* shader folders across DMSH_CHAIN bumps")
+              nvn_mtl.write_text(src, encoding="utf-8")
           PY
 
       - name: Update shader toolchain lock and header
