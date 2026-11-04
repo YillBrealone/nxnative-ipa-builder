@@ -634,6 +634,22 @@ jobs:
                   if (title_id & 0xFFF) == 0:
                       candidates.add(f"{title_id:016X}")
 
+          if not candidates:
+              try:
+                  sys.path.insert(0, str(Path.cwd() / "scripts"))
+                  import build_ipa_from_nsp as b
+                  keys_path = Path(sys.argv[1]).parent / "nxnative" / "prod.keys"
+                  keys = b.load_keys(keys_path) if keys_path.is_file() else {}
+                  for path in root.iterdir():
+                      if path.is_file() and path.suffix.lower() in {".nsp", ".xci"}:
+                          tid = b.probe_nca_title_id(path, keys)
+                          if tid:
+                              val = int(tid, 16)
+                              if (val & 0xFFF) == 0:
+                                  candidates.add(f"{val:016X}")
+              except Exception:
+                  pass
+
           if len(candidates) != 1:
               raise SystemExit(
                   "Could not uniquely identify the base game's title ID. "
@@ -661,86 +677,6 @@ jobs:
           echo "Shader profile ID: $PROFILE_ID"
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
-
-      - name: Apply Mario + Rabbids Kingdom Battle 4-DLC memory and texture fixes
-        if: env.DETECTED_TITLE_ID == '010067300059A000'
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Applying Snowdrop 4-DLC slab pool and CPU-streamed texture fixes for 010067300059A000..."
-          python - <<'PY'
-          import re
-          from pathlib import Path
-
-          # 1. Legacy patches.py fallback (for older nxnative revisions prior to snowdrop_pools.py)
-          patches_py = Path("dm/games/010067300059A000/patches.py")
-          if patches_py.exists():
-              text = patches_py.read_text(encoding="utf-8")
-              text = text.replace(
-                  "(0xea2190, 'e80360b2', '0800a4d2',",
-                  "(0xea2190, 'e80360b2', '0800a6d2',",
-              ).replace(
-                  "(0xea21c0, 'f60760b2', '1600b8d2',",
-                  "(0xea21c0, 'f60760b2', '1600bcd2',",
-              ).replace(
-                  "(0xea21cc, 'e00760b2', '0000b8d2',",
-                  "(0xea21cc, 'e00760b2', '0000bcd2',",
-              )
-              patches_py.write_text(text, encoding="utf-8")
-              print("Updated dm/games/010067300059A000/patches.py (768 MB slabs / 3.5 GB range)")
-
-          # 2. Expand snowdrop_pools in game.tsv (used by dm/tools/snowdrop_pools.py on current nxnative)
-          # from 2048 / 512 / 512 MB (3.00 GB) to 2048 / 640 / 1152 MB (3.75 GB total), giving the
-          # 64 KB slab pool 1,152 MB (2.25x larger than 512 MB) so loading Peach's Castle with all 4 DLCs
-          # does not hit the +3.00 GB shortage limit (GitHub issue #1010). Also enable tex_flush_upload
-          # and tex_dirty_upload so CPU-streamed textures re-upload when pool pages change.
-          game_tsv = Path("dm/games/010067300059A000/game.tsv")
-          if game_tsv.exists():
-              tsv = game_tsv.read_text(encoding="utf-8")
-              if re.search(r"^snowdrop_pools\t", tsv, re.M):
-                  tsv = re.sub(
-                      r"^snowdrop_pools\t.*$",
-                      "snowdrop_pools\t2048\t640\t1152",
-                      tsv,
-                      flags=re.M,
-                  )
-              else:
-                  tsv = tsv.rstrip("\n") + "\nsnowdrop_pools\t2048\t640\t1152\n"
-              if "tex_flush_upload\t" not in tsv:
-                  tsv = tsv.rstrip("\n") + "\ntex_flush_upload\ton\ntex_dirty_upload\ton\n"
-              game_tsv.write_text(tsv, encoding="utf-8")
-              print("Updated dm/games/010067300059A000/game.tsv: snowdrop_pools=2048/640/1152 (3.75 GB) + tex_flush_upload + tex_dirty_upload")
-
-          # 3. Allow uncompressed flags==0 textures in CPU-writable pools (Snowdrop's 1024x32x1
-          # color-grading LUTs, 128x128x6 cubemaps, 32x16x384 probe arrays, and 128x1x1 sky LUTs)
-          # to go through NvPkg (tex_cpu_content) instead of returning stale/zero textures from g_alias.
-          # Also allow Quick-Patch DmIOS binaries to fall back to an existing msl/b-* shader folder
-          # in the installed .app bundle when upstream bumps DMSH_CHAIN between builds.
-          nvn_mtl = Path("dm/gfx/nvn/nvn_mtl.m")
-          if nvn_mtl.exists():
-              src = nvn_mtl.read_text(encoding="utf-8")
-              old = "!(fmt_compressed(t->d.format) || t->d.target == NVN_TEXTURE_TARGET_3D)"
-              new = "!(fmt_compressed(t->d.format) || t->d.target == NVN_TEXTURE_TARGET_3D || !t->d.flags)"
-              if old in src:
-                  src = src.replace(old, new, 1)
-                  print("Updated tex_cpu_content in dm/gfx/nvn/nvn_mtl.m for uncompressed CPU-streamed textures")
-              old_dir = 'if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir]) MLOG("[RED] shader library directory %s does not exist:'
-              new_dir = (
-                  'if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir] && m) { '
-                  'for (NSString *sub in [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(m) error:nil]) '
-                  'if ([sub hasPrefix:@"b-"]) { g_msl_dir = [@(m) stringByAppendingPathComponent:sub]; break; } }\n    '
-                  + old_dir
-              )
-              if old_dir in src:
-                  src = src.replace(old_dir, new_dir, 1)
-                  src = src.replace('if (!head || ![head hasPrefix:want])', 'if (!head || (![head hasPrefix:want] && ![head hasPrefix:@"# chain b-"]))', 1)
-                  src = src.replace('if (!xh || ![xh hasPrefix:want])', 'if (!xh || (![xh hasPrefix:want] && ![xh hasPrefix:@"# chain b-"]))', 1)
-                  src = src.replace('![vj[@"chain"] isEqual:@DMSH_CHAIN] || ![fj[@"chain"] isEqual:@DMSH_CHAIN]', '!vj[@"chain"] || !fj[@"chain"]', 1)
-                  src = src.replace('![j[@"chain"] isEqual:@DMSH_CHAIN]', '!j[@"chain"]')
-                  src = src.replace('[j[@"chain"] isEqual:@DMSH_CHAIN]', '(j[@"chain"] != nil)')
-                  print("Updated dm/gfx/nvn/nvn_mtl.m to accept existing msl/b-* shader folders across DMSH_CHAIN bumps")
-              nvn_mtl.write_text(src, encoding="utf-8")
-          PY
 
       - name: Update shader toolchain lock and header
         shell: bash
@@ -834,16 +770,6 @@ jobs:
             done
           fi
 
-          # Also create a lightweight ~35 MB Quick-Patch zip (executable + dm/ tables only,
-          # without multi-GB romfs.img, aoc/, or msl/) for instant updates to an existing LiveContainer install.
-          APP_BUNDLE="$BUILD_DIR/ipa/build/ios/pkg/dd/Build/Products/Release-iphoneos/DmIOS.app"
-          if [[ -d "$APP_BUNDLE" ]]; then
-            (
-              cd "$APP_BUNDLE"
-              zip -rq "$RUNNER_TEMP/NxNative-QuickPatch.zip" DmIOS Info.plist PkgInfo Assets.car dm
-            ) || true
-          fi
-
           echo "IPA successfully created: $OUTPUT"
           ls -lh "$OUTPUT"
 
@@ -854,7 +780,6 @@ jobs:
         run: |
           set -euo pipefail
           OUTPUT="$RUNNER_TEMP/NxNative.ipa"
-          QUICK_PATCH="$RUNNER_TEMP/NxNative-QuickPatch.zip"
           IPA_SIZE="$(ls -lh "$OUTPUT" | awk '{print $5}')"
 
           # Pick the fastest Asia-Pacific Gofile server (with automatic fallback to global upload.gofile.io)
@@ -875,24 +800,6 @@ jobs:
           )"
           echo "Using Gofile upload endpoint: $UPLOAD_ENDPOINT"
 
-          QUICK_URL=""
-          QUICK_SIZE=""
-          if [[ -s "$QUICK_PATCH" ]]; then
-            QUICK_SIZE="$(ls -lh "$QUICK_PATCH" | awk '{print $5}')"
-            echo "Uploading lightweight Quick-Patch ($QUICK_SIZE) to Gofile..."
-            QP_RESP="$(curl -sS --retry 3 -F "file=@$QUICK_PATCH" "$UPLOAD_ENDPOINT" || curl -sS --retry 3 -F "file=@$QUICK_PATCH" https://upload.gofile.io/uploadfile || true)"
-            QUICK_URL="$(python - "$QP_RESP" <<'PY'
-          import json, sys
-          try:
-              data = json.loads(sys.argv[1])
-              if data.get("status") == "ok":
-                  print(data["data"]["downloadPage"])
-          except Exception:
-              pass
-          PY
-            )"
-          fi
-
           echo "Uploading NxNative.ipa ($IPA_SIZE) to Gofile for direct iPhone download..."
           RESPONSE="$(curl -sS --retry 3 -F "file=@$OUTPUT" "$UPLOAD_ENDPOINT" || curl -sS --retry 3 -F "file=@$OUTPUT" https://upload.gofile.io/uploadfile)"
 
@@ -907,37 +814,20 @@ jobs:
           PY
           )"
 
-          if [[ -n "$DOWNLOAD_URL" || -n "$QUICK_URL" ]]; then
-            LOWER_ID="$(echo "$DETECTED_TITLE_ID" | tr '[:upper:]' '[:lower:]')"
+          if [[ -n "$DOWNLOAD_URL" ]]; then
             echo "=========================================="
-            [[ -n "$QUICK_URL" ]] && echo "QUICK-PATCH DOWNLOAD LINK ($QUICK_SIZE): $QUICK_URL"
-            [[ -n "$DOWNLOAD_URL" ]] && echo "FULL IPA DOWNLOAD LINK ($IPA_SIZE): $DOWNLOAD_URL"
+            echo "DIRECT IPA DOWNLOAD LINK ($IPA_SIZE): $DOWNLOAD_URL"
             echo "=========================================="
             {
-              echo "## 📱 Direct iPhone Download Links (Asia-Pacific Optimized)"
+              echo "## 📱 Direct iPhone Download Link (Asia-Pacific Optimized)"
               echo "- **Game Title ID:** \`$DETECTED_TITLE_ID\`"
-              if [[ -n "$QUICK_URL" ]]; then
-                echo "- **⚡ [Quick-Patch Only ($QUICK_SIZE) — Tap to download NxNative-QuickPatch.zip]($QUICK_URL)** *(If the game is already installed in LiveContainer, unzip this and replace \`DmIOS\` + \`dm/\` inside \`LiveContainer/Applications/org.nxnative.${LOWER_ID}.app/\` instead of downloading the full $IPA_SIZE IPA!)*"
-              fi
-              if [[ -n "$DOWNLOAD_URL" ]]; then
-                echo "- **📦 [Full IPA ($IPA_SIZE) — Tap to download NxNative.ipa]($DOWNLOAD_URL)**"
-              fi
+              echo "- **📦 [Tap here to download NxNative.ipa ($IPA_SIZE) directly]($DOWNLOAD_URL)**"
               echo ""
               echo "_Tip: Open the link above on your iPhone to download directly without needing to unzip a GitHub artifact._"
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "::warning::Could not generate Gofile link; use the GitHub Artifact below instead."
           fi
-
-      - name: Upload Quick-Patch (Executable + Tables Only)
-        if: success()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: NxNative-QuickPatch-${{ env.DETECTED_TITLE_ID }}
-          path: ${{ runner.temp }}/NxNative-QuickPatch.zip
-          if-no-files-found: ignore
-          retention-days: 7
 
       - name: Upload IPA
         if: success()
