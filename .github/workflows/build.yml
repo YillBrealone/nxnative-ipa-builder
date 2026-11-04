@@ -669,11 +669,10 @@ jobs:
           set -euo pipefail
           echo "Applying Snowdrop 4-DLC slab pool and CPU-streamed texture fixes for 010067300059A000..."
           python - <<'PY'
+          import re
           from pathlib import Path
 
-          # 1. Expand Snowdrop's 512 KB and 64 KB slab pools from 512 MB each to 768 MB each
-          # (3.5 GB total reservation instead of 3.0 GB) so mounting all 4 DLCs does not
-          # exhaust the 64 KB slab pool (+3.00 GB / 0x70D0000000) at Peach's Castle.
+          # 1. Legacy patches.py fallback (for older nxnative revisions prior to snowdrop_pools.py)
           patches_py = Path("dm/games/010067300059A000/patches.py")
           if patches_py.exists():
               text = patches_py.read_text(encoding="utf-8")
@@ -690,15 +689,27 @@ jobs:
               patches_py.write_text(text, encoding="utf-8")
               print("Updated dm/games/010067300059A000/patches.py (768 MB slabs / 3.5 GB range)")
 
-          # 2. Enable tex_flush_upload and tex_dirty_upload in game.tsv so textures written
-          # or flushed by the CPU after initialization re-upload when their pool pages change.
+          # 2. Expand snowdrop_pools in game.tsv (used by dm/tools/snowdrop_pools.py on current nxnative)
+          # from 2048 / 512 / 512 MB (3.00 GB) to 2048 / 640 / 1152 MB (3.75 GB total), giving the
+          # 64 KB slab pool 1,152 MB (2.25x larger than 512 MB) so loading Peach's Castle with all 4 DLCs
+          # does not hit the +3.00 GB shortage limit (GitHub issue #1010). Also enable tex_flush_upload
+          # and tex_dirty_upload so CPU-streamed textures re-upload when pool pages change.
           game_tsv = Path("dm/games/010067300059A000/game.tsv")
           if game_tsv.exists():
               tsv = game_tsv.read_text(encoding="utf-8")
+              if re.search(r"^snowdrop_pools\t", tsv, re.M):
+                  tsv = re.sub(
+                      r"^snowdrop_pools\t.*$",
+                      "snowdrop_pools\t2048\t640\t1152",
+                      tsv,
+                      flags=re.M,
+                  )
+              else:
+                  tsv = tsv.rstrip("\n") + "\nsnowdrop_pools\t2048\t640\t1152\n"
               if "tex_flush_upload\t" not in tsv:
                   tsv = tsv.rstrip("\n") + "\ntex_flush_upload\ton\ntex_dirty_upload\ton\n"
-                  game_tsv.write_text(tsv, encoding="utf-8")
-                  print("Enabled tex_flush_upload and tex_dirty_upload in dm/games/010067300059A000/game.tsv")
+              game_tsv.write_text(tsv, encoding="utf-8")
+              print("Updated dm/games/010067300059A000/game.tsv: snowdrop_pools=2048/640/1152 (3.75 GB) + tex_flush_upload + tex_dirty_upload")
 
           # 3. Allow uncompressed flags==0 textures in CPU-writable pools (Snowdrop's 1024x32x1
           # color-grading LUTs, 128x128x6 cubemaps, 32x16x384 probe arrays, and 128x1x1 sky LUTs)
