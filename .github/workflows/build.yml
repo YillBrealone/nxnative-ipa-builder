@@ -676,7 +676,7 @@ jobs:
               print(f"{package.name}: {package.stat().st_size:,} bytes")
           PY
 
-      - name: Detect game title ID, IPA filename, and cool Handheld default
+      - name: Detect game title ID, IPA filename, and apply iPhone 17 Pro upgrades
         env:
           PROFILE_OVERRIDE: ${{ inputs.profile_id }}
           DEVICE_INPUT: ${{ inputs.device }}
@@ -685,20 +685,30 @@ jobs:
           set -euo pipefail
           GAME_DIR="$RUNNER_TEMP/GameFiles"
 
-          # Set Handheld mode (DM_OPMODE=0, 720p, lowest heat & battery drain) as the
-          # unlocked default in the Start Screen & In-Game Menu without locking it via env.txt.
-          # On NX2Apple builds, also expose Touch control size and Left stick position on the Start Screen.
+          # Apply iPhone 17 Pro & iOS Controls, Display, Thermal & Performance upgrades:
+          # - Cool Handheld mode (DM_OPMODE=0, 720p) as unlocked default
+          # - Point 1: Live mid-game Touch control size (DM_TOUCH_SIZE) & Left stick position (DM_TOUCH_STICK)
+          # - Point 2: One-tap Controller button swap (DM_PAD_MAP: Nintendo / Xbox & PS / Swap A-B) on Start Screen & Live Menu
+          # - Point 3: Controller slot mode (DM_PAD_MERGE: Separate Co-op / All Player 1) on Start Screen & Live Menu
+          # - Point 4: Unlock 120 FPS ProMotion (DM_FPS_TARGET=120) on iPhone 17 Pro
+          # - Point 5: Unlock Resolution Scale slider (DM_RENDER_SCALE 50%-100%) & Dynamic Resolution toggle for all games
           python - "$DEVICE_INPUT" <<'PY'
           import sys
           from pathlib import Path
 
           device = sys.argv[1]
+          gamepad_m = Path("dm/ios/Sources/DmGamepad.m")
+          has_touch_geo = gamepad_m.is_file() and "DmPadGeometry.h" in gamepad_m.read_text(encoding="utf-8", errors="replace")
+
           game_py = Path("dm/games/game.py")
           if game_py.is_file():
               txt = game_py.read_text(encoding="utf-8")
               txt = txt.replace(
                   "om = g.get('op_mode', 'console')",
                   "om = g.get('op_mode', 'handheld')",
+              ).replace(
+                  "fm = g.get('fps_max', '60')",
+                  "fm = g.get('fps_max', '120')",
               )
               game_py.write_text(txt, encoding="utf-8")
 
@@ -708,15 +718,161 @@ jobs:
               txt = txt.replace(
                   "DM_OPMODE\tchoice\t1=Docked,0=Handheld\tDM_GAME_OPMODE",
                   "DM_OPMODE\tchoice\t1=Docked,0=Handheld\t0|DM_GAME_OPMODE",
+              ).replace(
+                  "120=120 fps?DM_GAME_FPS_MAX==120&platform:mac",
+                  "120=120 fps?DM_GAME_FPS_MAX==120",
+              ).replace(
+                  "DM_RENDER_SCALE\trange\t0.5:1.0:0.05\t1.0\tfixups:RENDER_SCALE\tGame\tRender scale\t\tlevel=basic",
+                  "DM_RENDER_SCALE\trange\t0.5:1.0:0.05\t1.0\talways\tGame\tRender scale\tLowers resolution to keep the phone cool and save battery.\tlevel=basic",
+              ).replace(
+                  "DM_DYNAMIC_RESOLUTION\ttoggle\t-\t0\tfixups:DYNAMIC_RESOLUTION",
+                  "DM_DYNAMIC_RESOLUTION\ttoggle\t-\t0\talways",
               )
-              if "NX2Apple" in device and "DM_TOUCH_SIZE\t" not in txt:
-                  if not txt.endswith("\n"):
-                      txt += "\n"
+              if not txt.endswith("\n"):
+                  txt += "\n"
+              if has_touch_geo and "DM_TOUCH_SIZE\t" not in txt:
                   txt += (
                       "DM_TOUCH_SIZE\tchoice\tsmall=Small,medium=Medium,large=Large\tmedium\tplatform:ios\tControls\tTouch control size\t\tlevel=basic\n"
                       "DM_TOUCH_STICK\tchoice\tcorner=Corner,higher=Higher,inward=Inward\tcorner\tplatform:ios\tControls\tLeft stick position\t\tlevel=basic\n"
                   )
+              if "DM_PAD_MAP\t" not in txt:
+                  txt += (
+                      "DM_PAD_MAP\tchoice\tdefault=Nintendo (Default),xbox=Xbox / PlayStation (Swap A-B & X-Y),ab=Swap A-B only\tdefault\tplatform:ios\tControls\tController buttons\t\tlevel=basic\n"
+                      "DM_PAD_MERGE\tchoice\t0=Separate players (Co-op),1=All controllers as Player 1\t0\tplatform:ios\tControls\tController slots\t\tlevel=basic\n"
+                  )
               settings_tsv.write_text(txt, encoding="utf-8")
+
+          input_map_h = Path("dm/host/input_map.h")
+          if input_map_h.is_file():
+              txt = input_map_h.read_text(encoding="utf-8")
+              txt = txt.replace(
+                  "static int pad_map_parse(pad_map *m, const char *spec) { return im_parse(spec, IM_BUTTONS, im_pad_one, m); }",
+                  'static int pad_map_parse(pad_map *m, const char *spec) { if (spec && (!strcmp(spec, "default") || !strcmp(spec, "xbox") || !strcmp(spec, "ab"))) return 0; return im_parse(spec, IM_BUTTONS, im_pad_one, m); }',
+              )
+              input_map_h.write_text(txt, encoding="utf-8")
+
+          ue_cvar_py = Path("dm/tools/ue_cvar.py")
+          if ue_cvar_py.is_file():
+              txt = ue_cvar_py.read_text(encoding="utf-8")
+              if "'r.ScreenPercentage'" not in txt:
+                  txt = txt.replace(
+                      "'Project.FrameRateLimit')",
+                      "'Project.FrameRateLimit', 'r.ScreenPercentage')",
+                  )
+                  ue_cvar_py.write_text(txt, encoding="utf-8")
+
+          hle_uecvar_c = Path("dm/host/hle_uecvar.c")
+          if hle_uecvar_c.is_file():
+              txt = hle_uecvar_c.read_text(encoding="utf-8")
+              if "dm_ue_screen_pct_tick" not in txt:
+                  sp_helper = """static void dm_ue_screen_pct_tick(void) {
+              static int sp_state = -1, sp_nlog; static uint64_t sp_off; static float sp_want;
+              if (!sp_state) return;
+              if (sp_state < 0) {
+                  sp_state = 0;
+                  const char *rs = getenv("DM_RENDER_SCALE");
+                  if (!rs || !*rs) return;
+                  float sc = strtof(rs, NULL);
+                  if (!(sc >= 0.5f && sc < 0.99f)) return;
+                  sp_off = dm_ue_cvar("r.ScreenPercentage");
+                  if (!sp_off) return;
+                  sp_want = sc * 100.0f;
+                  LOG("main: Unreal r.ScreenPercentage at main+%#llx, scaled to %.0f%% (DM_RENDER_SCALE)", (unsigned long long)sp_off, sp_want);
+                  sp_state = 1;
+              }
+              uint8_t *base = NULL;
+              for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) base = g_mod[i].base;
+              uint64_t val;
+              if (!base || !rd((uint64_t)(uintptr_t)(base + sp_off + 0x10), &val, sizeof val) || !val) return;
+              for (int c = 0; c < 2; c++) {
+                  float cur, *p = (float *)(uintptr_t)(val + 4 * (uint64_t)c);
+                  if (!rd((uint64_t)(uintptr_t)p, &cur, sizeof cur) || !(cur >= 25.0f && cur <= 200.0f) || cur == sp_want) continue;
+                  uint32_t w; memcpy(&w, &sp_want, 4);
+                  dm_guest_write_prepare(p, 4); __atomic_store_n((uint32_t *)p, w, __ATOMIC_RELAXED);
+                  if (sp_nlog < 4) { sp_nlog++; LOG("main: Unreal r.ScreenPercentage (%s thread) %g -> %g%% (DM_RENDER_SCALE)", c ? "render" : "game", cur, sp_want); }
+              }
+          }
+          void dm_ue_cvar_tick(void) {
+              dm_ue_screen_pct_tick();"""
+                  txt = txt.replace("void dm_ue_cvar_tick(void) {", sp_helper, 1)
+                  hle_uecvar_c.write_text(txt, encoding="utf-8")
+
+          front_ios_m = Path("dm/ios/Sources/front_ios.m")
+          if front_ios_m.is_file():
+              txt = front_ios_m.read_text(encoding="utf-8")
+              if "front_screen_max_fps" not in txt:
+                  txt = txt.replace(
+                      "if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));",
+                      "if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));\n"
+                      '    const char *rs = getenv("DM_RENDER_SCALE"); if (rs && *rs) { float rsf = strtof(rs, NULL); if (rsf >= 0.5f && rsf < 1.0f) scale *= rsf; }',
+                  )
+                  txt = txt.replace(
+                      "bool dm_setting_live(const char *env, const char *value) {",
+                      "int front_screen_max_fps(void) { return (int)UIScreen.mainScreen.maximumFramesPerSecond; }\n"
+                      "void dm_gamepad_live_reload(void);\n"
+                      "bool dm_setting_live(const char *env, const char *value) {\n"
+                      '    if (env && (!strcmp(env, "DM_TOUCH_SIZE") || !strcmp(env, "DM_TOUCH_STICK") || !strcmp(env, "DM_PAD_MAP") || !strcmp(env, "DM_PAD_MERGE"))) {\n'
+                      "        if (value) dm_gamepad_live_reload();\n"
+                      "        return true;\n"
+                      "    }",
+                  )
+                  front_ios_m.write_text(txt, encoding="utf-8")
+
+          if gamepad_m.is_file():
+              txt = gamepad_m.read_text(encoding="utf-8")
+              if "dm_gamepad_live_reload" not in txt:
+                  swap_helper = """static int g_pad_swap_mode;
+          static void update_pad_swap_mode(void) {
+              const char *pm = getenv("DM_PAD_MAP");
+              g_pad_swap_mode = !pm ? 0 : !strcmp(pm, "xbox") ? 1 : !strcmp(pm, "ab") ? 2 : 0;
+          }
+          static uint64_t apply_pad_swap(uint64_t m) {
+              if (g_pad_swap_mode >= 1) {
+                  uint64_t a = (m >> B_A) & 1, b = (m >> B_B) & 1;
+                  m = (m & ~((1ull << B_A) | (1ull << B_B))) | (a << B_B) | (b << B_A);
+              }
+              if (g_pad_swap_mode == 1) {
+                  uint64_t x = (m >> B_X) & 1, y = (m >> B_Y) & 1;
+                  m = (m & ~((1ull << B_X) | (1ull << B_Y))) | (x << B_Y) | (y << B_X);
+              }
+              return m;
+          }
+          static void read_pad(GCExtendedGamepad *g) {"""
+                  txt = txt.replace("static void read_pad(GCExtendedGamepad *g) {", swap_helper, 1)
+                  txt = txt.replace(
+                      "dm_pad_set_player(p, m,",
+                      "m = apply_pad_swap(m); dm_pad_set_player(p, m,",
+                      1,
+                  )
+                  txt = txt.replace(
+                      "static void pads_start(void) {",
+                      "static void pads_start(void) {\n    update_pad_swap_mode();",
+                      1,
+                  )
+                  touch_reload = (
+                      '    const char *sz = getenv("DM_TOUCH_SIZE"); _opts.size = dm_pad_size_scale(sz);\n'
+                      '    const char *st = getenv("DM_TOUCH_STICK"); _opts.stick = dm_pad_stick_place(st);\n'
+                      "    _geoValid = NO;\n"
+                  ) if has_touch_geo else ""
+                  live_method = (
+                      "- (void)reloadLiveOptions {\n"
+                      "    [self reset];\n"
+                      + touch_reload +
+                      "    update_pad_swap_mode();\n"
+                      '    const char *e = getenv("DM_PAD_MERGE"); int want_merge = e && atoi(e);\n'
+                      "    if (want_merge != g_merge) { g_merge = want_merge; [self padsChanged:nil]; }\n"
+                      "    [self setNeedsLayout];\n"
+                      "}\n"
+                      "- (void)setTouchFeedback:(BOOL)on {"
+                  )
+                  txt = txt.replace("- (void)setTouchFeedback:(BOOL)on {", live_method, 1)
+                  txt = txt.replace(
+                      "void dm_gamepad_touch_feedback(bool on) { [g_view setTouchFeedback:on]; }",
+                      "void dm_gamepad_touch_feedback(bool on) { [g_view setTouchFeedback:on]; }\n"
+                      "void dm_gamepad_live_reload(void) { [g_view reloadLiveOptions]; }",
+                      1,
+                  )
+                  gamepad_m.write_text(txt, encoding="utf-8")
           PY
 
           DETECTED_ID="$(python - "$GAME_DIR" <<'PY'
