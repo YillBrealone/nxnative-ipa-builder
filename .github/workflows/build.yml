@@ -12,17 +12,17 @@ on:
           - "iPhone 15 Pro/Pro Max or newer (standard)"
           - "iPhone 15 or older (BC fallback)"
       game_url:
-        description: "Base Game Google Drive link (leave blank to use Game_URL secret)"
+        description: "Base Game (.nsp/.xci/.nsz/.xcz/.nup) Google Drive file or folder link (leave blank for Game_URL secret)"
         required: false
         type: string
         default: ""
       update_url:
-        description: "Update Google Drive link (optional; leave blank if none)"
+        description: "Update Google Drive file or folder share link (optional; leave blank if none)"
         required: false
         type: string
         default: ""
       dlc_url:
-        description: "DLC Google Drive file or folder link (optional; leave blank if none)"
+        description: "DLC Google Drive file or folder share link (optional; leave blank if none)"
         required: false
         type: string
         default: ""
@@ -122,84 +122,102 @@ jobs:
           download_file() {
             local url="$1"
             local output="$2"
-            local parsed_info kind target_id
+            local parsed_items item kind target_id
 
             if [[ -z "${url// /}" ]]; then
               echo "::error::A required download URL is empty."
               exit 1
             fi
 
-            parsed_info="$(python - "$url" <<'PY'
+            echo "::add-mask::$url"
+
+            parsed_items="$(python - "$url" <<'PY'
           import re
           import sys
           from urllib.parse import urlparse, parse_qs
 
-          url = sys.argv[1].strip()
-          parsed = urlparse(url)
-          query = parse_qs(parsed.query)
-          file_id = None
-          kind = "file"
+          raw = sys.argv[1].strip()
+          tokens = [t.strip() for t in re.split(r"[\s,;]+", raw) if t.strip()]
+          results = []
 
-          if "google.com" in parsed.netloc.lower():
-              folder_match = re.search(r"/folders/([^/?#]+)", parsed.path)
-              file_match = re.search(r"/(?:file/d|d)/([^/?#]+)", parsed.path)
-              if folder_match:
-                  file_id = folder_match.group(1)
-                  kind = "folder"
-              elif file_match:
-                  file_id = file_match.group(1)
-              elif query.get("id"):
-                  file_id = query["id"][0]
+          for token in tokens:
+              parsed = urlparse(token)
+              query = parse_qs(parsed.query)
+              file_id = None
+              kind = "file"
 
-          if not file_id and re.fullmatch(
-              r"[-A-Za-z0-9_]{20,}", url
-          ):
-              file_id = url
+              if "google.com" in parsed.netloc.lower():
+                  folder_match = re.search(r"/folders/([^/?#]+)", parsed.path)
+                  file_match = re.search(r"/(?:file/d|d)/([^/?#]+)", parsed.path)
+                  if folder_match:
+                      file_id = folder_match.group(1)
+                      kind = "folder"
+                  elif file_match:
+                      file_id = file_match.group(1)
+                  elif query.get("id"):
+                      file_id = query["id"][0]
 
-          if not file_id:
+              if not file_id and re.fullmatch(r"[-A-Za-z0-9_]{20,}", token):
+                  file_id = token
+
+              if file_id:
+                  results.append(f"{kind}:{file_id}:{token}")
+
+          if not results:
               raise SystemExit(
                   "Could not extract a Google Drive file or folder ID."
               )
 
-          print(f"{kind}:{file_id}")
+          print("\n".join(results))
           PY
           )"
 
-            kind="${parsed_info%%:*}"
-            target_id="${parsed_info#*:}"
-
-            # Mask both the raw URL and the extracted Google Drive ID so gdown
-            # never exposes your prod.keys or game links in public Actions logs.
-            echo "::add-mask::$url"
-            echo "::add-mask::$target_id"
+            while IFS= read -r item; do
+              [[ -z "$item" ]] && continue
+              kind="${item%%:*}"
+              local rest="${item#*:}"
+              target_id="${rest%%:*}"
+              local raw_token="${rest#*:}"
+              echo "::add-mask::$target_id"
+              echo "::add-mask::$raw_token"
+            done <<< "$parsed_items"
 
             (
               local gdown_home="$WORK/gdown_home_$(basename "$output")"
               mkdir -p "$gdown_home"
-              echo "Downloading $(basename "$output") ($kind)..."
-              if [[ "$kind" == "folder" ]]; then
-                HOME="$gdown_home" gdown --folder "$target_id" -O "$output"
-                if [[ ! -d "$output" ]] || [[ -z "$(ls -A "$output" 2>/dev/null)" ]]; then
-                  echo "::error::Downloaded Google Drive folder is empty."
-                  exit 1
+              local idx=0
+              while IFS= read -r item; do
+                [[ -z "$item" ]] && continue
+                idx=$((idx + 1))
+                kind="${item%%:*}"
+                local rest="${item#*:}"
+                target_id="${rest%%:*}"
+                echo "Downloading $(basename "$output") item #$idx ($kind)..."
+                if [[ "$kind" == "folder" ]]; then
+                  mkdir -p "$output"
+                  HOME="$gdown_home" gdown --folder "$target_id" -O "$output"
+                  if [[ ! -d "$output" ]] || [[ -z "$(ls -A "$output" 2>/dev/null)" ]]; then
+                    echo "::error::Downloaded Google Drive folder is empty."
+                    exit 1
+                  fi
+                elif [[ "$(basename "$output")" == "prod.keys" ]]; then
+                  HOME="$gdown_home" gdown "$target_id" -O "$output"
+                  if [[ ! -s "$output" ]]; then
+                    echo "::error::Downloaded prod.keys file is empty."
+                    exit 1
+                  fi
+                else
+                  # Download into a directory (-O "$output/") so gdown preserves the
+                  # original Google Drive filename (including [TitleID] and [vVersion]
+                  # tags required by standard-crypto / ticketless NSPs and updates).
+                  mkdir -p "$output"
+                  HOME="$gdown_home" gdown "$target_id" -O "$output/"
+                  if [[ -z "$(ls -A "$output" 2>/dev/null)" ]]; then
+                    echo "::error::Downloaded file directory is empty."
+                    exit 1
+                  fi
                 fi
-              elif [[ "$(basename "$output")" == "prod.keys" ]]; then
-                HOME="$gdown_home" gdown "$target_id" -O "$output"
-                if [[ ! -s "$output" ]]; then
-                  echo "::error::Downloaded prod.keys file is empty."
-                  exit 1
-                fi
-              else
-                # Download into a directory (-O "$output/") so gdown preserves the
-                # original Google Drive filename (including [TitleID] and [vVersion]
-                # tags required by standard-crypto / ticketless NSPs and updates).
-                mkdir -p "$output"
-                HOME="$gdown_home" gdown "$target_id" -O "$output/"
-                if [[ -z "$(ls -A "$output" 2>/dev/null)" ]]; then
-                  echo "::error::Downloaded file directory is empty."
-                  exit 1
-                fi
-              fi
+              done <<< "$parsed_items"
               echo "Finished downloading $(basename "$output")."
             ) &
             DOWNLOAD_PIDS+=("$!")
@@ -207,7 +225,12 @@ jobs:
 
           DOWNLOAD_PIDS=()
           download_file "$GAME_URL" "$WORK/game.download"
-          download_file "$KEYS_URL" "$WORK/prod.keys"
+
+          if [[ -n "${KEYS_URL// /}" ]]; then
+            download_file "$KEYS_URL" "$WORK/prod.keys"
+          else
+            echo "No KEYS_URL configured (only Switch 2 .nup packages can build without prod.keys)."
+          fi
 
           if [[ -n "${UPDATE_URL// /}" ]]; then
             download_file "$UPDATE_URL" "$WORK/update.download"
@@ -225,7 +248,9 @@ jobs:
             wait "$pid"
           done
 
-          chmod 600 "$WORK/prod.keys"
+          if [[ -f "$WORK/prod.keys" ]]; then
+            chmod 600 "$WORK/prod.keys"
+          fi
 
       - name: Extract RAR archives or accept direct game packages
         shell: bash
@@ -246,7 +271,7 @@ jobs:
           game_dir = Path(sys.argv[2])
           keys_path = work / "prod.keys"
           package_extensions = {
-              ".nsp", ".xci", ".nsz", ".xcz"
+              ".nsp", ".xci", ".nsz", ".xcz", ".nup"
           }
           archive_signatures = (
               b"Rar!\x1a\x07\x00",
@@ -284,6 +309,8 @@ jobs:
           def detect_package_extension(path):
               with path.open("rb") as f:
                   header = f.read(0x104)
+              if header[:4] == b"NUP\x01":
+                  return ".nup"
               if header[:4] == b"PFS0":
                   names = [n.lower() for n in pfs0_entries(path)]
                   if any(n.endswith(".ncz") for n in names):
@@ -301,6 +328,11 @@ jobs:
 
               suffix = path.suffix.lower()
 
+              if suffix == ".nup" and header[:4] != b"NUP\x01":
+                  raise SystemExit(
+                      f"Invalid {suffix} package signature: {path.name}"
+                  )
+
               if suffix in (".nsp", ".nsz") and header[:4] != b"PFS0":
                   raise SystemExit(
                       f"Invalid {suffix} package signature: {path.name}"
@@ -317,10 +349,16 @@ jobs:
               target = game_dir / source.name
 
               if target.exists():
+                  if target.stat().st_size == source.stat().st_size:
+                      print(
+                          f"Skipping duplicate package ({label}): {target.name} "
+                          f"({target.stat().st_size:,} bytes)"
+                      )
+                      return
                   target = game_dir / f"{label}_{source.name}"
 
               validate_package(source)
-              shutil.copy2(source, target)
+              shutil.move(str(source), str(target))
 
               print(
                   f"Added {label}: {target.name} "
@@ -335,19 +373,24 @@ jobs:
                   ["unar", "-o", str(extract_dir), str(archive_path)],
                   check=True,
               )
-              packages = sorted(
-                  p for p in extract_dir.rglob("*")
-                  if p.is_file()
-                  and not p.name.startswith("._")
-                  and "__MACOSX" not in p.parts
-                  and p.suffix.lower() in package_extensions
-              )
-              if not packages:
+              found = False
+              for p in sorted(extract_dir.rglob("*")):
+                  if not p.is_file() or p.name.startswith("._") or "__MACOSX" in p.parts:
+                      continue
+                  if p.suffix.lower() in package_extensions:
+                      add_package(p, label)
+                      found = True
+                  else:
+                      ext = detect_package_extension(p)
+                      if ext:
+                          renamed = p.with_name(f"{p.name}{ext}")
+                          p.rename(renamed)
+                          add_package(renamed, label)
+                          found = True
+              if not found:
                   raise SystemExit(
-                      f"No NSP/XCI/NSZ/XCZ packages found in {label} archive."
+                      f"No NSP/XCI/NSZ/XCZ/NUP packages found in {label} archive."
                   )
-              for package in packages:
-                  add_package(package, label)
 
           def process_download(label):
               source = work / f"{label}.download"
@@ -379,7 +422,7 @@ jobs:
                               found_any = True
                   if not found_any:
                       raise SystemExit(
-                          f"No NSP/XCI/NSZ/XCZ packages found in {label} download."
+                          f"No NSP/XCI/NSZ/XCZ/NUP packages found in {label} download."
                       )
                   return
 
@@ -403,7 +446,7 @@ jobs:
                   if not extension:
                       raise SystemExit(
                           f"{label} is not a recognized RAR/ZIP/7Z archive "
-                          "or direct NSP/XCI/NSZ/XCZ package."
+                          "or direct NSP/XCI/NSZ/XCZ/NUP package."
                       )
 
                   target = game_dir / f"{label}{extension}"
@@ -455,10 +498,9 @@ jobs:
                   )
                   pkg.unlink()
 
-          # Ensure every prepared package has either a .tik inside or a [TitleID]
-          # tag in its filename so ticketless (standard-crypto) NSPs and XCIs work
-          # across both standard and BC-fallback nxnative versions even when the
-          # original filename did not include [0100...].
+          # Ensure every prepared NSP/XCI package has either a .tik inside or a
+          # [TitleID] tag in its filename so ticketless (standard-crypto) NSPs
+          # and XCIs work across both standard and BC-fallback nxnative versions.
           import re
           header_key_hex = None
           if keys_path.is_file():
@@ -510,7 +552,7 @@ jobs:
               return None
 
           for pkg in sorted(game_dir.iterdir()):
-              if not pkg.is_file() or pkg.suffix.lower() not in package_extensions:
+              if not pkg.is_file() or pkg.suffix.lower() not in (".nsp", ".xci"):
                   continue
               has_tik = any(
                   re.fullmatch(r"[0-9A-Fa-f]{32}\.tik", n)
@@ -534,12 +576,14 @@ jobs:
           if not packages:
               raise SystemExit("No game packages were prepared.")
 
+          needs_keys = any(p.suffix.lower() in (".nsp", ".xci", ".nsz", ".xcz") for p in packages)
+          if needs_keys and (not keys_path.is_file() or keys_path.stat().st_size == 0):
+              raise SystemExit("prod.keys is required for NSP/XCI/NSZ/XCZ packages.")
+
           print("\n=== Prepared game packages ===")
           for package in packages:
               print(f"{package.name}: {package.stat().st_size:,} bytes")
           PY
-
-          test -s "$WORK/prod.keys"
 
       - name: Detect game title ID and select shader profile
         env:
@@ -556,7 +600,7 @@ jobs:
           from pathlib import Path
 
           root = Path(sys.argv[1])
-          extensions = {".nsp", ".xci", ".nsz", ".xcz"}
+          extensions = {".nsp", ".xci", ".nsz", ".xcz", ".nup"}
 
           def pfs0_names(path):
               try:
@@ -611,6 +655,17 @@ jobs:
               if not path.is_file() or path.suffix.lower() not in extensions:
                   continue
 
+              if path.suffix.lower() == ".nup":
+                  try:
+                      sys.path.insert(0, str(Path.cwd() / "scripts"))
+                      import pack_nup
+                      with pack_nup.Nup(path) as n:
+                          app, _, _, _ = pack_nup.scan(n)
+                          if app and (app & 0xFFF) == 0:
+                              candidates.add(f"{app:016X}")
+                  except Exception as exc:
+                      print(f"Warning: pack_nup scan failed for {path.name}: {exc}", file=sys.stderr)
+
               for name in pfs0_names(path):
                   match = re.fullmatch(
                       r"([0-9A-Fa-f]{16})[0-9A-Fa-f]{16}\.tik",
@@ -654,7 +709,7 @@ jobs:
               raise SystemExit(
                   "Could not uniquely identify the base game's title ID. "
                   f"Candidates found: {sorted(candidates)}. "
-                  "Check the base NSP and its ticket/filename."
+                  "Check the base NSP/NUP and its ticket/filename."
               )
 
           print(next(iter(candidates)))
@@ -749,9 +804,14 @@ jobs:
             cp -a "$SHADER_CACHE/shader" "$BUILD_DIR/shader"
           fi
 
+          KEYS_ARGS=()
+          if [[ -s "$WORK/prod.keys" ]]; then
+            KEYS_ARGS=(-k "$WORK/prod.keys")
+          fi
+
           python scripts/build_ipa_from_nsp.py \
             "$GAME_DIR" \
-            -k "$WORK/prod.keys" \
+            "${KEYS_ARGS[@]}" \
             -o "$OUTPUT"
 
           if [[ ! -s "$OUTPUT" ]]; then
