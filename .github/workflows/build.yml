@@ -11,21 +11,47 @@ on:
         options:
           - "iPhone 15 Pro/Pro Max or newer (standard)"
           - "iPhone 15 or older (BC fallback)"
+      build_mode:
+        description: "Build full IPA or run a fast 2-minute compatibility survey"
+        required: true
+        type: choice
+        default: "Build IPA (Default)"
+        options:
+          - "Build IPA (Default)"
+          - "Survey Only (Fast 2-min compatibility check)"
+      romfs_mode:
+        description: "Bundle game files inside IPA or build a tiny separate-RomFS update IPA"
+        required: true
+        type: choice
+        default: "bundle (Full all-in-one IPA - Default)"
+        options:
+          - "bundle (Full all-in-one IPA - Default)"
+          - "separate (Tiny ~100 MB update IPA without RomFS)"
       game_url:
-        description: "Base Game (.nsp/.xci/.nsz/.xcz/.nup) Google Drive file or folder link (leave blank for Game_URL secret)"
+        description: "Base Game (.nsp/.xci/.nsz/.xcz/.nup) Google Drive or direct HTTP link (blank = Game_URL secret)"
         required: false
         type: string
         default: ""
       update_url:
-        description: "Update Google Drive file or folder share link (optional; leave blank if none)"
+        description: "Update Google Drive or direct HTTP link (optional; leave blank if none)"
         required: false
         type: string
         default: ""
       dlc_url:
-        description: "DLC Google Drive file or folder share link (optional; leave blank if none)"
+        description: "DLC Google Drive or direct HTTP link (optional; leave blank if none)"
         required: false
         type: string
         default: ""
+      language:
+        description: "Default game language (optional, e.g. en-US, ja, fr, es, zh-Hans; unlocked in Start Screen)"
+        required: false
+        type: string
+        default: ""
+      show_fps:
+        description: "Enable FPS counter by default on Start Screen (stays unlocked in menu)"
+        required: false
+        type: boolean
+        default: true
       profile_id:
         description: "Optional nxnative profile ID override (leave blank for automatic detection)"
         required: false
@@ -43,6 +69,24 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Free up runner disk space for large games
+        shell: bash
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h /
+          sudo rm -rf \
+            /Library/Frameworks/Mono.framework \
+            /usr/local/share/android-sdk \
+            /usr/local/lib/android \
+            "$HOME/Library/Android" \
+            "$HOME/.ghcup" \
+            "$HOME/.rustup" \
+            "$HOME/.cargo" \
+            "$HOME/.gradle" \
+            "$HOME/.m2" 2>/dev/null || true
+          echo "=== Disk space after cleanup ==="
+          df -h /
+
       - name: Checkout BC fallback version
         if: inputs.device == 'iPhone 15 or older (BC fallback)'
         uses: actions/checkout@v4
@@ -162,10 +206,13 @@ jobs:
 
               if file_id:
                   results.append(f"{kind}:{file_id}:{token}")
+              elif parsed.scheme.lower() in ("http", "https"):
+                  # Direct HTTP/HTTPS URL (Pixeldrain, HuggingFace, Gofile direct, etc.)
+                  results.append(f"direct:{token}:{token}")
 
           if not results:
               raise SystemExit(
-                  "Could not extract a Google Drive file or folder ID."
+                  "Could not extract a Google Drive ID or direct HTTP/HTTPS URL."
               )
 
           print("\n".join(results))
@@ -191,7 +238,11 @@ jobs:
                 idx=$((idx + 1))
                 kind="${item%%:*}"
                 local rest="${item#*:}"
-                target_id="${rest%%:*}"
+                if [[ "$kind" == "direct" ]]; then
+                  target_id="$rest"
+                else
+                  target_id="${rest%%:*}"
+                fi
                 echo "Downloading $(basename "$output") item #$idx ($kind)..."
                 if [[ "$kind" == "folder" ]]; then
                   mkdir -p "$output"
@@ -201,9 +252,23 @@ jobs:
                     exit 1
                   fi
                 elif [[ "$(basename "$output")" == "prod.keys" ]]; then
-                  HOME="$gdown_home" gdown "$target_id" -O "$output"
+                  if [[ "$kind" == "direct" ]]; then
+                    curl -fL --retry 3 -o "$output" "$target_id"
+                  else
+                    HOME="$gdown_home" gdown "$target_id" -O "$output"
+                  fi
                   if [[ ! -s "$output" ]]; then
                     echo "::error::Downloaded prod.keys file is empty."
+                    exit 1
+                  fi
+                elif [[ "$kind" == "direct" ]]; then
+                  mkdir -p "$output"
+                  (
+                    cd "$output"
+                    curl -fL --retry 3 -O -J "$target_id"
+                  )
+                  if [[ -z "$(ls -A "$output" 2>/dev/null)" ]]; then
+                    echo "::error::Downloaded direct URL directory is empty."
                     exit 1
                   fi
                 else
@@ -373,6 +438,8 @@ jobs:
                   ["unar", "-o", str(extract_dir), str(archive_path)],
                   check=True,
               )
+              # Free archive disk space immediately after extraction
+              archive_path.unlink(missing_ok=True)
               found = False
               for p in sorted(extract_dir.rglob("*")):
                   if not p.is_file() or p.name.startswith("._") or "__MACOSX" in p.parts:
@@ -387,6 +454,7 @@ jobs:
                           p.rename(renamed)
                           add_package(renamed, label)
                           found = True
+              shutil.rmtree(extract_dir, ignore_errors=True)
               if not found:
                   raise SystemExit(
                       f"No NSP/XCI/NSZ/XCZ/NUP packages found in {label} archive."
@@ -420,6 +488,7 @@ jobs:
                               item.rename(renamed)
                               add_package(renamed, label)
                               found_any = True
+                  shutil.rmtree(source, ignore_errors=True)
                   if not found_any:
                       raise SystemExit(
                           f"No NSP/XCI/NSZ/XCZ/NUP packages found in {label} download."
@@ -456,7 +525,7 @@ jobs:
                           f"Output package already exists: {target.name}"
                       )
 
-                  shutil.copy2(source, target)
+                  shutil.move(str(source), str(target))
                   validate_package(target)
 
                   print(
@@ -585,13 +654,37 @@ jobs:
               print(f"{package.name}: {package.stat().st_size:,} bytes")
           PY
 
-      - name: Detect game title ID and select shader profile
+      - name: Detect game title ID, IPA filename, and cool Handheld default
         env:
           PROFILE_OVERRIDE: ${{ inputs.profile_id }}
         shell: bash
         run: |
           set -euo pipefail
           GAME_DIR="$RUNNER_TEMP/GameFiles"
+
+          # Set Handheld mode (DM_OPMODE=0, 720p, lowest heat & battery drain) as the
+          # unlocked default in the Start Screen & In-Game Menu without locking it via env.txt.
+          python - <<'PY'
+          from pathlib import Path
+
+          game_py = Path("dm/games/game.py")
+          if game_py.is_file():
+              txt = game_py.read_text(encoding="utf-8")
+              txt = txt.replace(
+                  "om = g.get('op_mode', 'console')",
+                  "om = g.get('op_mode', 'handheld')",
+              )
+              game_py.write_text(txt, encoding="utf-8")
+
+          settings_tsv = Path("dm/games/settings.tsv")
+          if settings_tsv.is_file():
+              txt = settings_tsv.read_text(encoding="utf-8")
+              txt = txt.replace(
+                  "DM_OPMODE\tchoice\t1=Docked,0=Handheld\tDM_GAME_OPMODE",
+                  "DM_OPMODE\tchoice\t1=Docked,0=Handheld\t0|DM_GAME_OPMODE",
+              )
+              settings_tsv.write_text(txt, encoding="utf-8")
+          PY
 
           DETECTED_ID="$(python - "$GAME_DIR" <<'PY'
           import re
@@ -729,11 +822,103 @@ jobs:
             echo "No profile directory for $DETECTED_ID; falling back to DEFAULT."
           fi
 
+          IPA_FILENAME="$(python - "$GAME_DIR" "$DETECTED_ID" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          game_dir = Path(sys.argv[1])
+          tid = sys.argv[2]
+
+          def clean_ipa_name(raw):
+              raw = re.sub(r"\[[^\]]*\]", "", raw)
+              raw = re.sub(r"\([^\)]*\)", "", raw)
+              cleaned = re.sub(r"[^A-Za-z0-9._-]+", "", raw.title().replace(" ", ""))
+              cleaned = cleaned.strip("._-")
+              if not cleaned:
+                  return f"Game-{tid}.ipa"
+              if not cleaned.lower().endswith(".ipa"):
+                  cleaned += ".ipa"
+              return cleaned
+
+          tsv = Path(f"dm/games/{tid}/game.tsv")
+          if tsv.is_file():
+              for line in tsv.read_text(encoding="utf-8", errors="replace").splitlines():
+                  if line.startswith("ipa\t"):
+                      val = line.split("\t", 1)[1].strip()
+                      if val:
+                          print(clean_ipa_name(val[:-4] if val.lower().endswith(".ipa") else val))
+                          raise SystemExit(0)
+                  if line.startswith("name\t"):
+                      val = line.split("\t", 1)[1].strip()
+                      if val:
+                          print(clean_ipa_name(val))
+                          raise SystemExit(0)
+
+          for p in sorted(game_dir.iterdir()):
+              if p.is_file() and p.suffix.lower() in {".nsp", ".xci", ".nup"}:
+                  if tid.lower() in p.name.lower() or p.suffix.lower() == ".nup":
+                      print(clean_ipa_name(p.stem))
+                      raise SystemExit(0)
+
+          print(f"NxNative-{tid}.ipa")
+          PY
+          )"
+
           echo "Shader profile ID: $PROFILE_ID"
+          echo "Output IPA filename: $IPA_FILENAME"
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
+          echo "IPA_FILENAME=$IPA_FILENAME" >> "$GITHUB_ENV"
+
+      - name: Run fast 2-minute compatibility survey (Survey Only mode)
+        if: inputs.build_mode == 'Survey Only (Fast 2-min compatibility check)'
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/nxnative"
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+
+          KEYS_ARGS=()
+          if [[ -s "$WORK/prod.keys" ]]; then
+            KEYS_ARGS=(-k "$WORK/prod.keys")
+          fi
+
+          SURVEY_ARGS=(--survey-only)
+          if python scripts/build_ipa_from_nsp.py --help 2>&1 | grep -q -- "--provisional"; then
+            SURVEY_ARGS+=(--provisional)
+          fi
+
+          python scripts/build_ipa_from_nsp.py \
+            "$GAME_DIR" \
+            "${KEYS_ARGS[@]}" \
+            "${SURVEY_ARGS[@]}"
+
+          {
+            echo "## 🔍 Compatibility Survey Report (\`$DETECTED_TITLE_ID\`)"
+            if [[ -f "dm/games/$DETECTED_TITLE_ID/README.md" ]]; then
+              echo "✅ **Official Profile Status:** Supported in \`dm/games/$DETECTED_TITLE_ID\`!"
+              echo ""
+              echo "<details><summary><b>View Official Profile Notes</b></summary>"
+              echo ""
+              cat "dm/games/$DETECTED_TITLE_ID/README.md"
+              echo ""
+              echo "</details>"
+              echo ""
+            else
+              echo "ℹ️ **Official Profile Status:** No official profile yet (uses automatic provisional profile)."
+              echo ""
+            fi
+            SURVEY_FILE="$(find "$GAME_DIR" -name "survey.md" -type f -print -quit)"
+            if [[ -n "$SURVEY_FILE" && -f "$SURVEY_FILE" ]]; then
+              cat "$SURVEY_FILE"
+            else
+              echo "_Survey completed (see job logs for details)._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Update shader toolchain lock and header
+        if: inputs.build_mode != 'Survey Only (Fast 2-min compatibility check)'
         shell: bash
         run: |
           set -euo pipefail
@@ -780,6 +965,7 @@ jobs:
           echo "SHADER_CACHE_HASH=$SHADER_HASH" >> "$GITHUB_ENV"
 
       - name: Restore compiled iOS shader cache
+        if: inputs.build_mode != 'Survey Only (Fast 2-min compatibility check)'
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/nxnative-shader-cache
@@ -789,12 +975,18 @@ jobs:
             nxnative-shaders-${{ env.DETECTED_TITLE_ID }}-
 
       - name: Build unsigned IPA
+        if: inputs.build_mode != 'Survey Only (Fast 2-min compatibility check)'
+        env:
+          ROMFS_MODE_INPUT: ${{ inputs.romfs_mode }}
+          LANG_INPUT: ${{ inputs.language }}
+          SHOW_FPS_INPUT: ${{ inputs.show_fps }}
+          DEVICE_INPUT: ${{ inputs.device }}
         shell: bash
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/nxnative"
           GAME_DIR="$RUNNER_TEMP/GameFiles"
-          OUTPUT="$RUNNER_TEMP/NxNative.ipa"
+          OUTPUT="$RUNNER_TEMP/$IPA_FILENAME"
           BUILD_DIR="$GAME_DIR/${DETECTED_TITLE_ID}_build"
           SHADER_CACHE="$RUNNER_TEMP/nxnative-shader-cache"
 
@@ -804,15 +996,39 @@ jobs:
             cp -a "$SHADER_CACHE/shader" "$BUILD_DIR/shader"
           fi
 
-          KEYS_ARGS=()
+          HELP_TEXT="$(python scripts/build_ipa_from_nsp.py --help 2>&1 || true)"
+
+          BUILD_ARGS=("$GAME_DIR" -o "$OUTPUT")
           if [[ -s "$WORK/prod.keys" ]]; then
-            KEYS_ARGS=(-k "$WORK/prod.keys")
+            BUILD_ARGS+=(-k "$WORK/prod.keys")
           fi
 
-          python scripts/build_ipa_from_nsp.py \
-            "$GAME_DIR" \
-            "${KEYS_ARGS[@]}" \
-            -o "$OUTPUT"
+          # Pre-compile Metal 4 pipeline archive for A19 Pro (g18p) on standard builds
+          if [[ "$DEVICE_INPUT" == "iPhone 15 Pro/Pro Max or newer (standard)" ]] && grep -q -- "--gpu" <<<"$HELP_TEXT"; then
+            BUILD_ARGS+=(--gpu g18p)
+          fi
+
+          # RomFS mode: bundle (full IPA, delete extracted files after packing to save 20-30 GB disk)
+          # or separate (slim ~100 MB update IPA, keep extracted RomFS.img)
+          if [[ "$ROMFS_MODE_INPUT" == separate* ]] && grep -q -- "--romfs" <<<"$HELP_TEXT"; then
+            BUILD_ARGS+=(--romfs separate)
+          elif grep -q -- "--no-keep-extracted" <<<"$HELP_TEXT"; then
+            BUILD_ARGS+=(--no-keep-extracted)
+          fi
+
+          # Optional default game language (unlocked in Start Screen)
+          if [[ -n "${LANG_INPUT// /}" ]]; then
+            BUILD_ARGS+=(-l "${LANG_INPUT// /}")
+          fi
+
+          # Default FPS counter toggle (unlocked in Start Screen)
+          if [[ "$SHOW_FPS_INPUT" == "false" ]] && grep -q -- "--no-show-fps" <<<"$HELP_TEXT"; then
+            BUILD_ARGS+=(--no-show-fps)
+          elif grep -q -- "--show-fps" <<<"$HELP_TEXT"; then
+            BUILD_ARGS+=(--show-fps)
+          fi
+
+          python scripts/build_ipa_from_nsp.py "${BUILD_ARGS[@]}"
 
           if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
@@ -834,12 +1050,12 @@ jobs:
           ls -lh "$OUTPUT"
 
       - name: Publish direct IPA download link
-        if: success()
+        if: success() && inputs.build_mode != 'Survey Only (Fast 2-min compatibility check)'
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          OUTPUT="$RUNNER_TEMP/NxNative.ipa"
+          OUTPUT="$RUNNER_TEMP/$IPA_FILENAME"
           IPA_SIZE="$(ls -lh "$OUTPUT" | awk '{print $5}')"
 
           # Pick the fastest Asia-Pacific Gofile server (with automatic fallback to global upload.gofile.io)
@@ -860,7 +1076,7 @@ jobs:
           )"
           echo "Using Gofile upload endpoint: $UPLOAD_ENDPOINT"
 
-          echo "Uploading NxNative.ipa ($IPA_SIZE) to Gofile for direct iPhone download..."
+          echo "Uploading $IPA_FILENAME ($IPA_SIZE) to Gofile for direct iPhone download..."
           RESPONSE="$(curl -sS --retry 3 -F "file=@$OUTPUT" "$UPLOAD_ENDPOINT" || curl -sS --retry 3 -F "file=@$OUTPUT" https://upload.gofile.io/uploadfile)"
 
           DOWNLOAD_URL="$(python - "$RESPONSE" <<'PY'
@@ -876,12 +1092,13 @@ jobs:
 
           if [[ -n "$DOWNLOAD_URL" ]]; then
             echo "=========================================="
-            echo "DIRECT IPA DOWNLOAD LINK ($IPA_SIZE): $DOWNLOAD_URL"
+            echo "DIRECT IPA DOWNLOAD LINK ($IPA_FILENAME - $IPA_SIZE): $DOWNLOAD_URL"
             echo "=========================================="
             {
               echo "## 📱 Direct iPhone Download Link (Asia-Pacific Optimized)"
-              echo "- **Game Title ID:** \`$DETECTED_TITLE_ID\`"
-              echo "- **📦 [Tap here to download NxNative.ipa ($IPA_SIZE) directly]($DOWNLOAD_URL)**"
+              echo "- **Game:** \`$IPA_FILENAME\` (\`$DETECTED_TITLE_ID\`)"
+              echo "- **Default Console Mode:** \`Handheld (Cool 720p mode)\` — unlocked in Start Screen & In-Game Menu"
+              echo "- **📦 [Tap here to download $IPA_FILENAME ($IPA_SIZE) directly]($DOWNLOAD_URL)**"
               echo ""
               echo "_Tip: Open the link above on your iPhone to download directly without needing to unzip a GitHub artifact._"
             } >> "$GITHUB_STEP_SUMMARY"
@@ -890,12 +1107,12 @@ jobs:
           fi
 
       - name: Upload IPA
-        if: success()
+        if: success() && inputs.build_mode != 'Survey Only (Fast 2-min compatibility check)'
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: NxNative-IPA-${{ inputs.device == 'iPhone 15 or older (BC fallback)' && 'BC-Fallback' || 'Standard' }}
-          path: ${{ runner.temp }}/NxNative.ipa
+          name: ${{ env.IPA_FILENAME }}
+          path: ${{ runner.temp }}/${{ env.IPA_FILENAME }}
           if-no-files-found: error
           retention-days: 7
 
