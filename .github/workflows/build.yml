@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       device:
-        description: "Choose the target device and texture support path"
+        description: "Choose the target device and engine version"
         required: true
         type: choice
-        default: "iPhone 15 Pro/Pro Max or newer (standard)"
+        default: "iPhone 15 Pro/Pro Max or newer - NX2Apple Patched (Default)"
         options:
+          - "iPhone 15 Pro/Pro Max or newer - NX2Apple Patched (Default)"
           - "iPhone 15 Pro/Pro Max or newer (standard)"
-          - "iPhone 15 or older (BC fallback)"
+          - "iPad (2020 A12Z) / iPhone 15 or older (Metal 3 + BC fallback)"
       build_mode:
         description: "Build full IPA or run a fast 2-minute compatibility survey"
         required: true
@@ -87,12 +88,12 @@ jobs:
           echo "=== Disk space after cleanup ==="
           df -h /
 
-      - name: Checkout BC fallback version
-        if: inputs.device == 'iPhone 15 or older (BC fallback)'
+      - name: Checkout NX2Apple patched engine (Default)
+        if: inputs.device == 'iPhone 15 Pro/Pro Max or newer - NX2Apple Patched (Default)'
         uses: actions/checkout@v4
         with:
-          repository: mianmuhammadse/nxnative
-          ref: d158df611bf2f3fa315c4f16585575cdfdb2a1d3
+          repository: LNPANDY/NX2Apple
+          ref: main
 
       - name: Checkout standard nxnative version
         if: inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)'
@@ -101,10 +102,31 @@ jobs:
           repository: seedds/nxnative
           ref: main
 
+      - name: Checkout Metal 3 + BC fallback version (2020 iPad Pro / iPhone 15 or older)
+        if: inputs.device == 'iPad (2020 A12Z) / iPhone 15 or older (Metal 3 + BC fallback)'
+        uses: actions/checkout@v4
+        with:
+          repository: widmonstertony/nxnative
+          ref: ios16-ios17-compat
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      - name: Sync NX2Apple engine patches
+        if: inputs.device == 'iPhone 15 Pro/Pro Max or newer - NX2Apple Patched (Default)'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/engine.py sync
+          for dir in dm scripts docs ref; do
+            if [[ -e "engine/$dir" ]]; then
+              rm -rf "$dir"
+              cp -a "engine/$dir" "$dir"
+            fi
+          done
+          rm -rf engine
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
@@ -120,7 +142,7 @@ jobs:
           set -euo pipefail
           brew install xcodegen zstd spirv-cross unar glslang
           python -m pip install -q \
-            lz4 capstone fonttools backports.zstd gdown nsz
+            lz4 "capstone>=5,<6" fonttools backports.zstd gdown nsz zbic
 
           # Xcode 26/27 runners ship the Metal shader compiler
           # as a separate on-demand component; the build script requires
@@ -657,6 +679,7 @@ jobs:
       - name: Detect game title ID, IPA filename, and cool Handheld default
         env:
           PROFILE_OVERRIDE: ${{ inputs.profile_id }}
+          DEVICE_INPUT: ${{ inputs.device }}
         shell: bash
         run: |
           set -euo pipefail
@@ -664,9 +687,12 @@ jobs:
 
           # Set Handheld mode (DM_OPMODE=0, 720p, lowest heat & battery drain) as the
           # unlocked default in the Start Screen & In-Game Menu without locking it via env.txt.
-          python - <<'PY'
+          # On NX2Apple builds, also expose Touch control size and Left stick position on the Start Screen.
+          python - "$DEVICE_INPUT" <<'PY'
+          import sys
           from pathlib import Path
 
+          device = sys.argv[1]
           game_py = Path("dm/games/game.py")
           if game_py.is_file():
               txt = game_py.read_text(encoding="utf-8")
@@ -683,6 +709,13 @@ jobs:
                   "DM_OPMODE\tchoice\t1=Docked,0=Handheld\tDM_GAME_OPMODE",
                   "DM_OPMODE\tchoice\t1=Docked,0=Handheld\t0|DM_GAME_OPMODE",
               )
+              if "NX2Apple" in device and "DM_TOUCH_SIZE\t" not in txt:
+                  if not txt.endswith("\n"):
+                      txt += "\n"
+                  txt += (
+                      "DM_TOUCH_SIZE\tchoice\tsmall=Small,medium=Medium,large=Large\tmedium\tplatform:ios\tControls\tTouch control size\t\tlevel=basic\n"
+                      "DM_TOUCH_STICK\tchoice\tcorner=Corner,higher=Higher,inward=Inward\tcorner\tplatform:ios\tControls\tLeft stick position\t\tlevel=basic\n"
+                  )
               settings_tsv.write_text(txt, encoding="utf-8")
           PY
 
@@ -936,9 +969,6 @@ jobs:
             exit 1
           fi
 
-          # Newer nxnative (standard repo) moved lock handling into
-          # tool_lock.py; the pinned BC fallback revision still handles
-          # it inside dmsh_chain.py itself.
           if [[ -n "$LOCK_SCRIPT" ]]; then
             python "$LOCK_SCRIPT" --update-lock
           else
@@ -969,9 +999,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/nxnative-shader-cache
-          key: nxnative-shaders-${{ env.DETECTED_TITLE_ID }}-${{ inputs.device == 'iPhone 15 or older (BC fallback)' && 'bc' || 'std' }}-${{ env.SHADER_CACHE_HASH }}
+          key: nxnative-shaders-${{ env.DETECTED_TITLE_ID }}-${{ contains(inputs.device, 'BC fallback') && 'bc' || 'std' }}-${{ env.SHADER_CACHE_HASH }}
           restore-keys: |
-            nxnative-shaders-${{ env.DETECTED_TITLE_ID }}-${{ inputs.device == 'iPhone 15 or older (BC fallback)' && 'bc' || 'std' }}-
+            nxnative-shaders-${{ env.DETECTED_TITLE_ID }}-${{ contains(inputs.device, 'BC fallback') && 'bc' || 'std' }}-
             nxnative-shaders-${{ env.DETECTED_TITLE_ID }}-
 
       - name: Build unsigned IPA
@@ -1003,17 +1033,31 @@ jobs:
             BUILD_ARGS+=(-k "$WORK/prod.keys")
           fi
 
-          # Pre-compile Metal 4 pipeline archive for A19 Pro (g18p) on standard builds
-          if [[ "$DEVICE_INPUT" == "iPhone 15 Pro/Pro Max or newer (standard)" ]] && grep -q -- "--gpu" <<<"$HELP_TEXT"; then
+          # Device-specific renderer & pipeline archive settings
+          if [[ "$DEVICE_INPUT" == *"BC fallback"* ]]; then
+            export DM_IOS_RENDERER=legacy
+            export DM_LEGACY_TARGET=a10x
+            if grep -q -- "--gpu" <<<"$HELP_TEXT"; then
+              BUILD_ARGS+=(--gpu none)
+            fi
+          elif grep -q -- "--gpu" <<<"$HELP_TEXT"; then
+            # Pre-compile Metal 4 pipeline archive for A19 Pro (g18p) on iPhone 17 Pro builds
             BUILD_ARGS+=(--gpu g18p)
           fi
 
-          # RomFS mode: bundle (full IPA, delete extracted files after packing to save 20-30 GB disk)
-          # or separate (slim ~100 MB update IPA, keep extracted RomFS.img)
-          if [[ "$ROMFS_MODE_INPUT" == separate* ]] && grep -q -- "--romfs" <<<"$HELP_TEXT"; then
-            BUILD_ARGS+=(--romfs separate)
-          elif grep -q -- "--no-keep-extracted" <<<"$HELP_TEXT"; then
-            BUILD_ARGS+=(--no-keep-extracted)
+          # RomFS mode: bundle (full all-in-one IPA, delete extracted files after packing)
+          # or separate (slim ~100 MB update IPA without RomFS)
+          if [[ "$ROMFS_MODE_INPUT" == separate* ]]; then
+            export DM_COPY_ROMFS=NO
+            if grep -q -- "--romfs" <<<"$HELP_TEXT"; then
+              BUILD_ARGS+=(--romfs separate)
+            fi
+          else
+            export DM_FULL_ROMFS=1
+            export DM_COPY_ROMFS=YES
+            if grep -q -- "--no-keep-extracted" <<<"$HELP_TEXT"; then
+              BUILD_ARGS+=(--no-keep-extracted)
+            fi
           fi
 
           # Optional default game language (unlocked in Start Screen)
@@ -1097,6 +1141,7 @@ jobs:
             {
               echo "## 📱 Direct iPhone Download Link (Asia-Pacific Optimized)"
               echo "- **Game:** \`$IPA_FILENAME\` (\`$DETECTED_TITLE_ID\`)"
+              echo "- **Engine:** \`${{ inputs.device }}\`"
               echo "- **Default Console Mode:** \`Handheld (Cool 720p mode)\` — unlocked in Start Screen & In-Game Menu"
               echo "- **📦 [Tap here to download $IPA_FILENAME ($IPA_SIZE) directly]($DOWNLOAD_URL)**"
               echo ""
