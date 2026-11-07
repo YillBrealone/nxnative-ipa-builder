@@ -685,49 +685,144 @@ jobs:
           set -euo pipefail
           GAME_DIR="$RUNNER_TEMP/GameFiles"
 
-          # Apply iPhone 17 Pro & iOS Controls, Display, Thermal & Performance upgrades:
-          # - Cool Handheld mode (DM_OPMODE=0, 720p) as unlocked default
+          # Apply iPhone 17 Pro & 2020 iPad Pro Controls, Display, Thermal & Performance upgrades:
+          # - Zero-lag OpenGL/NVN cursor & frame presentation on iPad Pro (MTLSharedEvent sync + CAMetalDisplayLink 120Hz + predictive touch)
+          # - Live in-game Aspect Ratios (16:9, Fill Screen, 16:10, 4:3, 21:9) + All Start Menu settings in the Top-Center "⋯" Menu
+          # - Cool Handheld mode (DM_OPMODE=0, 720p) & UK English (en-GB) as unlocked defaults
+          # - Instant game boot (skips Start Screen by default) + 100% English UI across all engines
           # - Point 1: Live mid-game Touch control size (DM_TOUCH_SIZE) & Left stick position (DM_TOUCH_STICK)
-          # - Point 2: One-tap Controller button swap (DM_PAD_MAP: Nintendo / Xbox & PS / Swap A-B) on Start Screen & Live Menu
-          # - Point 3: Controller slot mode (DM_PAD_MERGE: Separate Co-op / All Player 1) on Start Screen & Live Menu
-          # - Point 4: Unlock 120 FPS ProMotion (DM_FPS_TARGET=120) on iPhone 17 Pro
-          # - Point 5: Unlock Resolution Scale slider (DM_RENDER_SCALE 50%-100%) & Dynamic Resolution toggle for all games
-          python - "$DEVICE_INPUT" <<'PY'
-          import sys
+          # - Point 2: One-tap Controller button swap (DM_PAD_MAP: Nintendo / Xbox & PS / Swap A-B)
+          # - Point 3: Controller slot mode (DM_PAD_MERGE: Separate Co-op / All Player 1)
+          # - Point 4: Unlock 120 FPS ProMotion (DM_FPS_TARGET=120) on iPhone 17 Pro & iPad Pro
+          # - Point 5: Unlock Resolution Scale (DM_RENDER_SCALE 50%-100%) & Dynamic Resolution toggle
+          python - <<'PY'
+          import re
           from pathlib import Path
 
-          device = sys.argv[1]
           gamepad_m = Path("dm/ios/Sources/DmGamepad.m")
           has_touch_geo = gamepad_m.is_file() and "DmPadGeometry.h" in gamepad_m.read_text(encoding="utf-8", errors="replace")
 
-          # Fix upstream typo in widmonstertony/nxnative legacy renderer (nvn_mtl_legacy.inc:4733)
-          # where TONTON_SHADER_CHAIN was left unrenamed after DMSH_CHAIN migration.
+          # 1. Fix iPad legacy renderer (nvn_mtl_legacy.inc) & OpenGL cursor lag (hle_gl.m):
+          #    - Fix TONTON_SHADER_CHAIN -> DMSH_CHAIN compile error
+          #    - Enable CAMetalDisplayLink (DM_HAVE_METAL_DISPLAY_LINK=1, iOS 17.0 target, A12Z LSE atomics)
+          #    - Synchronize OpenGL/Vulkan mtl_present_ext via MTLSharedEvent so present_now never blits stale 3-frame-old cursor textures
+          #    - Default DM_PRESENT_FIFO=0 (newest frame immediately) & support live DM_FPS_TARGET + live DM_ASPECT_MODE viewport
           legacy_inc = Path("dm/gfx/nvn/nvn_mtl_legacy.inc")
           if legacy_inc.is_file():
               txt = legacy_inc.read_text(encoding="utf-8")
-              if "TONTON_SHADER_CHAIN" in txt:
-                  txt = txt.replace("TONTON_SHADER_CHAIN", "DMSH_CHAIN")
-                  legacy_inc.write_text(txt, encoding="utf-8")
+              txt = (
+                  txt.replace("TONTON_SHADER_CHAIN", "DMSH_CHAIN")
+                  .replace("#define DM_HAVE_METAL_DISPLAY_LINK 0", "#define DM_HAVE_METAL_DISPLAY_LINK 1")
+                  .replace(
+                      'fifo = !(e && !strcmp(e, "0"));',
+                      'fifo = (e && !strcmp(e, "1"));',
+                  )
+                  .replace(
+                      "g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;",
+                      "g_link_hold_until = (fifo && submitted && it.period > 0.025) ? update.targetPresentationTimestamp + it.period : 0;",
+                  )
+                  .replace(
+                      "if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};",
+                      'const char *am = getenv("DM_ASPECT_MODE"); if ((am && *am && strcmp(am, "16:9")) || fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};',
+                  )
+                  .replace(
+                      "int mtl_fps_target(void) {",
+                      'int mtl_fps_target(void) { const char *ft = getenv("DM_FPS_TARGET"); if (ft && *ft) { int v = atoi(ft); if (v == 30 || v == 60 || v == 120) return v; }',
+                  )
+                  .replace(
+                      "if (want && mtl_fps_target() == 30) want = 3;",
+                      "if (want && mtl_fps_target() == 30) want = 3; else if (want && mtl_fps_target() == 120) want = 2;",
+                  )
+              )
+              if "g_ext_ev_val" not in txt:
+                  txt = txt.replace(
+                      "typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; } pq_item;",
+                      "typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; } pq_item;\n"
+                      "static __strong id<MTLSharedEvent> g_ext_ev;\n"
+                      "static _Atomic uint64_t g_ext_ev_val;",
+                  ).replace(
+                      "    id<MTLCommandBuffer> cb = [g_q commandBuffer];\n    if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { return 0; }",
+                      "    id<MTLCommandBuffer> cb = [g_q commandBuffer];\n"
+                      "    uint64_t ev_v = atomic_load_explicit(&g_ext_ev_val, memory_order_acquire);\n"
+                      "    if (ev_v && g_ext_ev) [cb encodeWaitForEvent:g_ext_ev value:ev_v];\n"
+                      "    if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { return 0; }",
+                  ).replace(
+                      "uint64_t mtl_present_ext(uint64_t serial, double period, void *event, uint64_t event_value, const int crop[4]) {\n    (void)event; (void)event_value;",
+                      "uint64_t mtl_present_ext(uint64_t serial, double period, void *event, uint64_t event_value, const int crop[4]) {\n"
+                      "    if (event && !g_ext_ev) g_ext_ev = (__bridge id<MTLSharedEvent>)event;\n"
+                      "    if (event_value) atomic_store_explicit(&g_ext_ev_val, event_value, memory_order_release);",
+                  )
+              legacy_inc.write_text(txt, encoding="utf-8")
 
-          # Set default game language to UK English (en-GB) while keeping the Start Screen
-          # Game language picker unlocked and falling back cleanly if a title lacks en-GB.
-          build_nsp_py = Path("scripts/build_ipa_from_nsp.py")
-          if build_nsp_py.is_file():
-              txt = build_nsp_py.read_text(encoding="utf-8")
+          nvn_mtl_m = Path("dm/gfx/nvn/nvn_mtl.m")
+          if nvn_mtl_m.is_file():
+              txt = nvn_mtl_m.read_text(encoding="utf-8")
               txt = txt.replace(
+                  "if (fabs((dw / dh) / (pw / ph) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};",
+                  'const char *am = getenv("DM_ASPECT_MODE"); if ((am && *am && strcmp(am, "16:9")) || fabs((dw / dh) / (pw / ph) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};',
+              ).replace(
+                  "int mtl_fps_target(void) {",
+                  'int mtl_fps_target(void) { const char *ft = getenv("DM_FPS_TARGET"); if (ft && *ft) { int v = atoi(ft); if (v == 30 || v == 60 || v == 120) return v; }',
+              )
+              nvn_mtl_m.write_text(txt, encoding="utf-8")
+
+          hle_gl_m = Path("dm/gfx/gl/hle_gl.m")
+          if hle_gl_m.is_file():
+              txt = hle_gl_m.read_text(encoding="utf-8")
+              txt = txt.replace(
+                  "        int vs = S.swap_interval < 1 ? 1 : S.swap_interval > 4 ? 4 : S.swap_interval;\n"
+                  "        int k = g_win.cur;\n"
+                  "        g_win.ticket[k] = mtl_present_ext(g_win.serial[k], vs / 60.0, (__bridge void *)g_ev, v, NULL);\n"
+                  "        g_win.cur = (k + 1) % NWIN;\n"
+                  "        if (g_win.ticket[g_win.cur]) mtl_present_wait(g_win.ticket[g_win.cur]);",
+                  "        int fps_t = mtl_fps_target();\n"
+                  "        int vs = (fps_t >= 60) ? 1 : (S.swap_interval < 1 ? 1 : S.swap_interval > 4 ? 4 : S.swap_interval);\n"
+                  "        int k = g_win.cur, prev = (k + NWIN - 1) % NWIN;\n"
+                  "        if (g_win.ticket[prev]) mtl_present_wait(g_win.ticket[prev]);\n"
+                  "        g_win.ticket[k] = mtl_present_ext(g_win.serial[k], (fps_t >= 120) ? (1.0 / 120.0) : (vs / 60.0), (__bridge void *)g_ev, v, NULL);\n"
+                  "        g_win.cur = (k + 1) % NWIN;\n"
+                  "        if (g_win.ticket[g_win.cur]) mtl_present_wait(g_win.ticket[g_win.cur]);",
+              ).replace(
+                  "uint64_t period = 1000000000ull * vs / 60, now = now_ns();",
+                  "uint64_t period = (fps_t >= 120) ? (1000000000ull / 120) : (1000000000ull * vs / 60), now = now_ns();",
+              )
+              hle_gl_m.write_text(txt, encoding="utf-8")
+
+          # 2. Default game language to UK English (en-GB), enable iOS 17.0 CAMetalDisplayLink target & A12Z LSE atomics
+          for p, old, new in [
+              (
+                  Path("scripts/build_ipa_from_nsp.py"),
                   "want_lang = language_code(lang_in) if lang_in else 'en-US'",
                   "want_lang = language_code(lang_in) if lang_in else 'en-GB'",
-              )
-              build_nsp_py.write_text(txt, encoding="utf-8")
-
-          build_ipa_sh = Path("dm/ios/tools/build_ipa.sh")
-          if build_ipa_sh.is_file():
-              txt = build_ipa_sh.read_text(encoding="utf-8")
-              txt = txt.replace(
+              ),
+              (
+                  Path("dm/ios/tools/build_ipa.sh"),
                   "export DM_LANG=${DM_LANG:-en-US}",
                   "export DM_LANG=${DM_LANG:-en-GB}",
-              )
-              build_ipa_sh.write_text(txt, encoding="utf-8")
+              ),
+              (
+                  Path("dm/ios/tools/build_ipa.sh"),
+                  "legacy) export DM_IOS_DEPLOYMENT_TARGET=16.1 ;;",
+                  "legacy) export DM_IOS_DEPLOYMENT_TARGET=17.0 ;;",
+              ),
+              (
+                  Path("dm/ios/tools/gen_build.py"),
+                  "'16.1'",
+                  "'17.0'",
+              ),
+              (
+                  Path("dm/ios/project.yml"),
+                  "-mcpu=apple-a10",
+                  "-mcpu=apple-a12",
+              ),
+              (
+                  Path("dm/ios/project.yml"),
+                  "zh-Hans",
+                  "en-GB",
+              ),
+          ]:
+              if p.is_file():
+                  p.write_text(p.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
 
           hle_oe_c = Path("dm/host/hle_oe.c")
           if hle_oe_c.is_file():
@@ -741,6 +836,7 @@ jobs:
               )
               hle_oe_c.write_text(txt, encoding="utf-8")
 
+          # 3. Default Console mode to Handheld (720p) and unlock 120 FPS ProMotion + Aspect Ratios in game.py & settings.tsv
           game_py = Path("dm/games/game.py")
           if game_py.is_file():
               txt = game_py.read_text(encoding="utf-8")
@@ -756,22 +852,39 @@ jobs:
           settings_tsv = Path("dm/games/settings.tsv")
           if settings_tsv.is_file():
               txt = settings_tsv.read_text(encoding="utf-8")
-              txt = txt.replace(
-                  "DM_OPMODE\tchoice\t1=Docked,0=Handheld\tDM_GAME_OPMODE",
-                  "DM_OPMODE\tchoice\t1=Docked,0=Handheld\t0|DM_GAME_OPMODE",
-              ).replace(
-                  "120=120 fps?DM_GAME_FPS_MAX==120&platform:mac",
-                  "120=120 fps?DM_GAME_FPS_MAX==120",
-              ).replace(
-                  "DM_RENDER_SCALE\trange\t0.5:1.0:0.05\t1.0\tfixups:RENDER_SCALE\tGame\tRender scale\t\tlevel=basic",
-                  "DM_RENDER_SCALE\trange\t0.5:1.0:0.05\t1.0\talways\tGame\tRender scale\tLowers resolution to keep the phone cool and save battery.\tlevel=basic",
-              ).replace(
-                  "DM_DYNAMIC_RESOLUTION\ttoggle\t-\t0\tfixups:DYNAMIC_RESOLUTION",
-                  "DM_DYNAMIC_RESOLUTION\ttoggle\t-\t0\talways",
+              txt = (
+                  txt.replace(
+                      "DM_OPMODE\tchoice\t1=Docked,0=Handheld\tDM_GAME_OPMODE",
+                      "DM_OPMODE\tchoice\t1=Docked,0=Handheld\t0|DM_GAME_OPMODE",
+                  )
+                  .replace(
+                      "120=120 fps?DM_GAME_FPS_MAX==120&platform:mac",
+                      "120=120 fps",
+                  )
+                  .replace(
+                      "DM_FPS_TARGET\tchoice\t30=30 fps,60=60 fps\tDM_GAME_FPS_TARGET",
+                      "DM_FPS_TARGET\tchoice\t30=30 fps,60=60 fps,120=120 fps\tDM_GAME_FPS_TARGET",
+                  )
+                  .replace(
+                      "\tDM_GAME_FPS_TARGET\tDM_GAME_FPS_TARGET!=0\tGame\tFrame rate",
+                      "\t60|DM_GAME_FPS_TARGET\talways\tGame\tFrame rate",
+                  )
+                  .replace(
+                      "DM_RENDER_SCALE\trange\t0.5:1.0:0.05\t1.0\tfixups:RENDER_SCALE\tGame\tRender scale\t\tlevel=basic",
+                      "DM_RENDER_SCALE\trange\t0.5:1.0:0.05\t1.0\talways\tGame\tRender scale\tLowers resolution to keep the device cool and save battery.\tlevel=basic",
+                  )
+                  .replace(
+                      "DM_DYNAMIC_RESOLUTION\ttoggle\t-\t0\tfixups:DYNAMIC_RESOLUTION",
+                      "DM_DYNAMIC_RESOLUTION\ttoggle\t-\t0\talways",
+                  )
               )
               if not txt.endswith("\n"):
                   txt += "\n"
-              if has_touch_geo and "DM_TOUCH_SIZE\t" not in txt:
+              if "DM_ASPECT_MODE\t" not in txt:
+                  txt += (
+                      "DM_ASPECT_MODE\tchoice\t16:9=16:9 (Default Widescreen),fill=Fill Screen (Full Display),16:10=16:10 (Widescreen),4:3=4:3 (Retro / Classic),21:9=21:9 (Ultrawide)\t16:9\tplatform:ios\tGame\tAspect ratio\t\tlevel=basic\n"
+                  )
+              if "DM_TOUCH_SIZE\t" not in txt:
                   txt += (
                       "DM_TOUCH_SIZE\tchoice\tsmall=Small,medium=Medium,large=Large\tmedium\tplatform:ios\tControls\tTouch control size\t\tlevel=basic\n"
                       "DM_TOUCH_STICK\tchoice\tcorner=Corner,higher=Higher,inward=Inward\tcorner\tplatform:ios\tControls\tLeft stick position\t\tlevel=basic\n"
@@ -783,6 +896,7 @@ jobs:
                   )
               settings_tsv.write_text(txt, encoding="utf-8")
 
+          # 4. Allow single-word DM_PAD_MAP preset names and Unreal screen percentage
           input_map_h = Path("dm/host/input_map.h")
           if input_map_h.is_file():
               txt = input_map_h.read_text(encoding="utf-8")
@@ -796,11 +910,10 @@ jobs:
           if ue_cvar_py.is_file():
               txt = ue_cvar_py.read_text(encoding="utf-8")
               if "'r.ScreenPercentage'" not in txt:
-                  txt = txt.replace(
-                      "'Project.FrameRateLimit')",
-                      "'Project.FrameRateLimit', 'r.ScreenPercentage')",
+                  ue_cvar_py.write_text(
+                      txt.replace("'Project.FrameRateLimit')", "'Project.FrameRateLimit', 'r.ScreenPercentage')"),
+                      encoding="utf-8",
                   )
-                  ue_cvar_py.write_text(txt, encoding="utf-8")
 
           hle_uecvar_c = Path("dm/host/hle_uecvar.c")
           if hle_uecvar_c.is_file():
@@ -835,9 +948,9 @@ jobs:
           }
           void dm_ue_cvar_tick(void) {
               dm_ue_screen_pct_tick();"""
-                  txt = txt.replace("void dm_ue_cvar_tick(void) {", sp_helper, 1)
-                  hle_uecvar_c.write_text(txt, encoding="utf-8")
+                  hle_uecvar_c.write_text(txt.replace("void dm_ue_cvar_tick(void) {", sp_helper, 1), encoding="utf-8")
 
+          # 5. Patch front_ios.m (Live Aspect Ratios, DM_RENDER_SCALE, 120Hz ProMotion query, live reload, in-game settings sheet, English FPS label)
           front_ios_m = Path("dm/ios/Sources/front_ios.m")
           if front_ios_m.is_file():
               txt = front_ios_m.read_text(encoding="utf-8")
@@ -851,23 +964,178 @@ jobs:
                       'CGFloat scale = l.contentsScale; const char *rs = getenv("DM_RENDER_SCALE"); if (rs && *rs) { float rsf = strtof(rs, NULL); if (rsf >= 0.5f && rsf < 1.0f) scale *= rsf; }\n'
                       "    l.drawableSize = CGSizeMake(self.bounds.size.width * scale, self.bounds.size.height * scale);",
                   )
-              if "front_screen_max_fps" not in txt:
+              if "dm_aspect_rect" not in txt:
+                  aspect_helper = """void dm_gamepad_live_reload(void);
+          CGRect dm_aspect_rect(CGRect b) {
+              CGFloat bw = b.size.width, bh = b.size.height;
+              if (bw <= 0 || bh <= 0) return b;
+              const char *m = getenv("DM_ASPECT_MODE");
+              if (!m || !*m) {
+                  NSString *s = [NSUserDefaults.standardUserDefaults stringForKey:@"launcher.DM_ASPECT_MODE"];
+                  if (s.length) m = s.UTF8String;
+              }
+              if (m && !strcmp(m, "fill")) return b;
+              CGFloat ratio = 16.0 / 9.0;
+              if (m && !strcmp(m, "16:10")) ratio = 16.0 / 10.0;
+              else if (m && !strcmp(m, "4:3")) ratio = 4.0 / 3.0;
+              else if (m && !strcmp(m, "21:9")) ratio = 21.0 / 9.0;
+              CGFloat w = bw, h = bh;
+              if (w / h > ratio) w = h * ratio; else h = w / ratio;
+              return CGRectMake(floor((bw - w) / 2.0), floor((bh - h) / 2.0), floor(w), floor(h));
+          }
+          """
+                  txt = txt.replace("@interface DmGameView : UIView", aspect_helper + "@interface DmGameView : UIView", 1)
+                  txt = txt.replace(
+                      "    if (!dm_za_fullscreen_active() && !dm_game_fullscreen_active()) {\n"
+                      "        if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;\n"
+                      "    }\n"
+                      "    self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);",
+                      "    if (!dm_za_fullscreen_active() && !dm_game_fullscreen_active()) self.game.frame = dm_aspect_rect(b);\n"
+                      "    else self.game.frame = b;",
+                  ).replace(
+                      "if (!onTV) self.game.frame = layout.game;",
+                      'if (!onTV && getenv("DM_ASPECT_MODE") && strcmp(getenv("DM_ASPECT_MODE"), "16:9")) layout.game = dm_aspect_rect(b);\n'
+                      "    if (!onTV) self.game.frame = layout.game;",
+                  )
+              # The legacy pad uses the actual game view, not an estimate from the screen.
+              # This also follows full-screen profiles and changes to the aspect setting.
+              if "dm_touch_picture_rect" not in txt and "dm_gamepad_arrange" not in txt:
+                  marker = "static DmRootVC *g_root;"
+                  assert marker in txt, "Cannot locate legacy game view for touch mapping"
+                  txt = txt.replace(marker, marker + """
+          CGRect dm_touch_picture_rect(UIView *pad) {
+              if (!g_root.game || !pad.window || g_root.game.window != pad.window) return CGRectZero;
+              CGRect picture = [pad convertRect:g_root.game.bounds fromView:g_root.game];
+              const char *mode = getenv("DM_ASPECT_MODE");
+              if (!mode || !*mode || !strcmp(mode, "16:9")) {
+                  CGFloat w = picture.size.width, h = picture.size.height;
+                  if (w <= 0 || h <= 0) return CGRectZero;
+                  if (w / h > 16.0 / 9.0) {
+                      CGFloat fit = h * 16.0 / 9.0; picture.origin.x += (w - fit) / 2; picture.size.width = fit;
+                  } else {
+                      CGFloat fit = w * 9.0 / 16.0; picture.origin.y += (h - fit) / 2; picture.size.height = fit;
+                  }
+              }
+              return picture;
+          }
+          """, 1)
+              if "dm_apply_setting_live" not in txt:
+                  has_show_fps_method = "- (void)showFPS:(BOOL)on" in txt
+                  fps_toggle_code = (
+                      "[g_root showFPS:atoi(value) != 0];"
+                      if has_show_fps_method
+                      else "if (atoi(value)) { if (!g_root.fps) { g_root.fps = front_ios_fps_label(); if (g_root.fps) [g_root.view addSubview:g_root.fps]; } g_root.fps.hidden = NO; } else if (g_root.fps) { g_root.fps.hidden = YES; } [g_root.view setNeedsLayout];"
+                  )
+                  live_fn = f"""static void settings_sheet_done(void) {{
+              dm_gamepad_live_reload();
+              if (g_root) {{ [g_root.view setNeedsLayout]; [g_root.view layoutIfNeeded]; [g_root.game setNeedsLayout]; }}
+          }}
+          void dm_open_settings_sheet(void) {{
+              if (!g_root || g_root.presentedViewController) return;
+              setenv("DM_LAUNCHER", "1", 1);
+              dm_show_launcher((__bridge void *)g_root, settings_sheet_done);
+              setenv("DM_LAUNCHER", "0", 1);
+          }}
+          void dm_apply_setting_live(const char *env, const char *value) {{
+              if (!env || !value) return;
+              setenv(env, value, 1);
+              NSString *k = [NSString stringWithFormat:@"launcher.%s", env];
+              [NSUserDefaults.standardUserDefaults setObject:[NSString stringWithUTF8String:value] forKey:k];
+              dispatch_async(dispatch_get_main_queue(), ^{{
+                  if (!g_root) return;
+                  if (!strcmp(env, "DM_ASPECT_MODE") || !strcmp(env, "DM_RENDER_SCALE")) {{
+                      [g_root.view setNeedsLayout]; [g_root.view layoutIfNeeded];
+                      [g_root.game setNeedsLayout]; [g_root.game layoutIfNeeded];
+                  }} else if (!strcmp(env, "DM_OPMODE")) {{
+                      dm_set_opmode(atoi(value) ? 1 : 0);
+                      dm_gamepad_live_reload();
+                  }} else if (!strcmp(env, "DM_SHOW_FPS")) {{
+                      {fps_toggle_code}
+                  }} else if (!strcmp(env, "DM_METAL_HUD")) {{
+                      if (g_layer) g_layer.developerHUDProperties = atoi(value) ? @{{@"mode": @"default"}} : nil;
+                  }} else if (!strcmp(env, "DM_TOUCH_SIZE") || !strcmp(env, "DM_TOUCH_STICK") || !strcmp(env, "DM_PAD_MAP") || !strcmp(env, "DM_PAD_MERGE") || !strcmp(env, "DM_TOUCH_HAPTICS") || !strcmp(env, "DM_RUMBLE")) {{
+                      dm_gamepad_live_reload();
+                  }}
+              }});
+          }}
+          static void launcher_done(void) {{ [g_root startGame]; }}"""
+                  txt = txt.replace("static void launcher_done(void) { [g_root startGame]; }", live_fn, 1)
+              if "bool dm_setting_live(" in txt and "DM_ASPECT_MODE" not in txt.split("bool dm_setting_live(")[1]:
                   txt = txt.replace(
                       "bool dm_setting_live(const char *env, const char *value) {",
                       "int front_screen_max_fps(void) { return (int)UIScreen.mainScreen.maximumFramesPerSecond; }\n"
-                      "void dm_gamepad_live_reload(void);\n"
                       "bool dm_setting_live(const char *env, const char *value) {\n"
-                      '    if (env && (!strcmp(env, "DM_TOUCH_SIZE") || !strcmp(env, "DM_TOUCH_STICK") || !strcmp(env, "DM_PAD_MAP") || !strcmp(env, "DM_PAD_MERGE"))) {\n'
-                      "        if (value) dm_gamepad_live_reload();\n"
-                      "        return true;\n"
-                      "    }",
+                      "    if (env && value) dm_apply_setting_live(env, value);\n"
+                      '    if (env && (!strcmp(env, "DM_ASPECT_MODE") || !strcmp(env, "DM_RENDER_SCALE") || !strcmp(env, "DM_FPS_TARGET") || !strcmp(env, "DM_METAL_HUD") || !strcmp(env, "DM_TOUCH_SIZE") || !strcmp(env, "DM_TOUCH_STICK") || !strcmp(env, "DM_PAD_MAP") || !strcmp(env, "DM_PAD_MERGE"))) return true;',
                   )
+              txt = txt.replace('@"渲染 %.0f · 显示 %.0f"', '@"Render %.0f · Display %.0f"')
               front_ios_m.write_text(txt, encoding="utf-8")
 
+          # 6. Patch DmGamepad.m (Points 1-3 + predictive 120Hz touch + responsive stick curve + three Control Modes [2D / 3D / Tap] + full Top-Center "⋯" UIMenu on all builds)
+          pad_geom_h = Path("dm/ios/Sources/DmPadGeometry.h")
+          if pad_geom_h.is_file():
+              pad_geom_h.write_text(
+                  pad_geom_h.read_text(encoding="utf-8").replace("K_FULL = 0.8,", "K_FULL = 0.72,").replace("K_DEAD = 0.1,", "K_DEAD = 0.05,"),
+                  encoding="utf-8",
+              )
           if gamepad_m.is_file():
               txt = gamepad_m.read_text(encoding="utf-8")
+              txt = txt.replace("K_FULL = 0.8,", "K_FULL = 0.72,").replace("K_DEAD = 0.1,", "K_DEAD = 0.05,")
+              txt = txt.replace(
+                  "if (kind == C_NONE && !_stick[1] && [self inRightArea:p])",
+                  "if (kind == C_NONE && _full && !_stick[1] && [self inRightArea:p])",
+              )
+              txt = txt.replace(
+                  "uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff); CGPoint p = [t locationInView:self];",
+                  "uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff); UITouch *pt = (e ? [e predictedTouchesForTouch:t].lastObject : nil) ?: t; CGPoint p = [pt locationInView:self];",
+              )
+              if "if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;" in txt:
+                  txt = txt.replace(
+                      "    CGRect b = self.bounds; CGFloat w = b.size.width, h = b.size.height;\n"
+                      "    if (w <= 0 || h <= 0) return;\n"
+                      "    if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;\n"
+                      "    CGFloat x0 = (b.size.width - w) / 2, y0 = (b.size.height - h) / 2;",
+                      "    CGRect dm_touch_picture_rect(UIView *pad);\n"
+                      "    CGRect gr = dm_touch_picture_rect(self);\n"
+                      "    CGFloat x0 = gr.origin.x, y0 = gr.origin.y, w = gr.size.width, h = gr.size.height;\n"
+                      "    if (w <= 0 || h <= 0) { dm_touch_set(NULL, 0); return; }",
+                  )
+                  marker = "- (BOOL)gameBegin:(UITouch *)t {\n"
+                  assert marker in txt, "Cannot locate legacy touch entry point"
+                  txt = txt.replace(marker, marker +
+                      "    CGRect dm_touch_picture_rect(UIView *pad);\n"
+                      "    CGRect picture = dm_touch_picture_rect(self);\n"
+                      "    if (CGRectIsEmpty(picture) || !CGRectContainsPoint(picture, [t locationInView:self])) return NO;\n", 1)
+              # Use the same actual laid-out picture for modern builds, rejecting black bars.
+              txt = txt.replace(
+                  "if (CGRectIsEmpty(_layout.game) || (_layout.separated && !CGRectContainsPoint(_layout.game, [t locationInView:self]))) return NO;",
+                  "if (CGRectIsEmpty(_layout.game) || !CGRectContainsPoint(_layout.game, [t locationInView:self])) return NO;",
+              )
+              txt = txt.replace('@"gearshape.fill"', '@"ellipsis"')
+              if not has_touch_geo and "dm_touch_size_mult" not in txt:
+                  touch_helpers = """static CGFloat dm_touch_size_mult(void) {
+              const char *s = getenv("DM_TOUCH_SIZE");
+              return !s ? 1.0 : !strcmp(s, "small") ? 0.85 : !strcmp(s, "large") ? 1.18 : 1.0;
+          }
+          static CGPoint dm_touch_stick_shift(CGPoint p, CGFloat u) {
+              const char *s = getenv("DM_TOUCH_STICK");
+              if (s && !strcmp(s, "higher")) p.y -= 34.0 * u;
+              else if (s && !strcmp(s, "inward")) p.x += 34.0 * u;
+              return p;
+          }
+          - (CGFloat)u {"""
+                  txt = txt.replace(
+                      "return MIN(self.bounds.size.height / 430.0, 1.3); }",
+                      "return MIN(self.bounds.size.height / 430.0, 1.3) * dm_touch_size_mult(); }",
+                  ).replace("- (CGFloat)u {", touch_helpers, 1).replace(
+                      "return side(s, 0, K_STICK_X * self.u, CGRectGetMaxY(s) - K_PAD_Y * self.u);",
+                      "return dm_touch_stick_shift(side(s, 0, K_STICK_X * self.u, CGRectGetMaxY(s) - K_PAD_Y * self.u), self.u);",
+                  )
               if "dm_gamepad_live_reload" not in txt:
-                  swap_helper = """static int g_pad_swap_mode;
+                  swap_helper = """void dm_open_settings_sheet(void);
+          void dm_apply_setting_live(const char *env, const char *value);
+          CGRect dm_aspect_rect(CGRect b);
+          static int g_pad_swap_mode;
           static void update_pad_swap_mode(void) {
               const char *pm = getenv("DM_PAD_MAP");
               g_pad_swap_mode = !pm ? 0 : !strcmp(pm, "xbox") ? 1 : !strcmp(pm, "ab") ? 2 : 0;
@@ -884,77 +1152,202 @@ jobs:
               return m;
           }
           static void read_pad(GCExtendedGamepad *g) {"""
-                  txt = txt.replace("static void read_pad(GCExtendedGamepad *g) {", swap_helper, 1)
-                  txt = txt.replace(
-                      "dm_pad_set_player(p, m,",
-                      "m = apply_pad_swap(m); dm_pad_set_player(p, m,",
-                      1,
-                  )
-                  txt = txt.replace(
-                      "static void pads_start(void) {",
-                      "static void pads_start(void) {\n    update_pad_swap_mode();",
-                      1,
+                  txt = (
+                      txt.replace("static void read_pad(GCExtendedGamepad *g) {", swap_helper, 1)
+                      .replace("dm_pad_set_player(p, m,", "m = apply_pad_swap(m); dm_pad_set_player(p, m,", 1)
+                      .replace("static void pads_start(void) {", "static void pads_start(void) {\n    update_pad_swap_mode();", 1)
                   )
                   touch_reload = (
                       '    const char *sz = getenv("DM_TOUCH_SIZE"); _opts.size = dm_pad_size_scale(sz);\n'
                       '    const char *st = getenv("DM_TOUCH_STICK"); _opts.stick = dm_pad_stick_place(st);\n'
                       "    _geoValid = NO;\n"
                   ) if has_touch_geo else ""
+                  pad_notify_sel = "inputDevicesChanged" if "inputDevicesChanged:" in txt else "padsChanged"
                   live_method = (
                       "- (void)reloadLiveOptions {\n"
                       "    [self reset];\n"
                       + touch_reload +
                       "    update_pad_swap_mode();\n"
+                      '    const char *th = getenv("DM_TOUCH_HAPTICS");\n'
+                      "    if (th && !atoi(th)) _touchFeedback = nil;\n"
+                      "    else if (!_touchFeedback) { _touchFeedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight]; [_touchFeedback prepare]; }\n"
+                      '    const char *rm = getenv("DM_RUMBLE");\n'
+                      "    if (rm) dm_haptics_suspend(4u, !atoi(rm));\n"
                       '    const char *e = getenv("DM_PAD_MERGE"); int want_merge = e && atoi(e);\n'
-                      "    if (want_merge != g_merge) { g_merge = want_merge; [self padsChanged:nil]; }\n"
+                      f"    if (want_merge != g_merge) {{ g_merge = want_merge; [self {pad_notify_sel}:nil]; }}\n"
+                      "    [self applyLayout];\n"
                       "    [self setNeedsLayout];\n"
                       "}\n"
-                      "- (void)setTouchFeedback:(BOOL)on {"
+                      "- (void)reset {"
                   )
-                  txt = txt.replace("- (void)setTouchFeedback:(BOOL)on {", live_method, 1)
-                  txt = txt.replace(
-                      "void dm_gamepad_touch_feedback(bool on) { [g_view setTouchFeedback:on]; }",
-                      "void dm_gamepad_touch_feedback(bool on) { [g_view setTouchFeedback:on]; }\n"
-                      "void dm_gamepad_live_reload(void) { [g_view reloadLiveOptions]; }",
+                  txt = txt.replace("- (void)reset {", live_method, 1).replace(
+                      "UIView *dm_gamepad_view(CGRect frame) {",
+                      "void dm_gamepad_live_reload(void) { [g_view reloadLiveOptions]; }\n"
+                      "UIView *dm_gamepad_view(CGRect frame) {",
                       1,
                   )
-                  gamepad_m.write_text(txt, encoding="utf-8")
+                  if "_swapLabel.string = _tap ?" in txt:
+                      txt = (
+                          txt.replace(
+                              "CAShapeLayer *_swap; CATextLayer *_swapLabel; BOOL _swapHeld;",
+                              "CAShapeLayer *_swap; CATextLayer *_swapLabel; BOOL _swapHeld; UIButton *_topMenuBtn;",
+                          )
+                          .replace(
+                              '_swap = shape(_controls); _swapLabel = label(_swap, @"");',
+                              '_swap = shape(_controls); _swapLabel = label(_swap, @"⋯");\n'
+                              "        _topMenuBtn = [UIButton buttonWithType:UIButtonTypeCustom];\n"
+                              "        _topMenuBtn.backgroundColor = UIColor.clearColor;\n"
+                              "        _topMenuBtn.showsMenuAsPrimaryAction = YES;\n"
+                              "        _topMenuBtn.menu = [self buildTopNativeMenu];\n"
+                              "        __weak DmGamepad *weakMenuSelf = self;\n"
+                              "        [_topMenuBtn addAction:[UIAction actionWithHandler:^(UIAction *a) { (void)a; [weakMenuSelf reset]; }] forControlEvents:UIControlEventMenuActionTriggered];\n"
+                              "        [self addSubview:_topMenuBtn];",
+                          )
+                          .replace(
+                              '_swapLabel.string = _tap ? @"Tap" : _full ? @"3D" : @"2D";',
+                              '_swapLabel.string = @"⋯";',
+                          )
+                          .replace(
+                              "CGPoint sc = self.swapCenter; setPath(_swap, circlePath(sc, K_SWAP_R * u)); placeLabel(_swapLabel, sc, 12 * u);",
+                              "CGPoint sc = self.swapCenter; setPath(_swap, circlePath(sc, K_SWAP_R * u)); placeLabel(_swapLabel, sc, 14 * u);\n"
+                              "    CGFloat mr = K_SWAP_R * u * 1.5; _topMenuBtn.frame = CGRectMake(sc.x - mr, sc.y - mr, 2 * mr, 2 * mr);",
+                          )
+                          .replace(
+                              "if ([self inSwap:p]) { [_owner setObject:@(C_SWAP) forKey:t]; continue; }",
+                              "if ([self inSwap:p]) continue;",
+                          )
+                      )
+                      ipad_menu_methods = """- (void)setPadLayoutMode:(int)l {
+              [self reset];
+              if (l == 2 && dm_opmode() != 0) return;
+              _full = l == 1; _tap = l == 2;
+              [NSUserDefaults.standardUserDefaults setObject:@(l) forKey:dm_layout_preference_key()];
+              [self applyLayout]; [self setNeedsLayout];
+          }
+          - (NSString *)currentSettingValue:(NSString *)env def:(NSString *)def {
+              const char *c = getenv(env.UTF8String);
+              if (c && *c) return [NSString stringWithUTF8String:c];
+              NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:[@"launcher." stringByAppendingString:env]];
+              return saved.length ? saved : def;
+          }
+          - (UIMenuElement *)menuRowForEnv:(NSString *)env label:(NSString *)label kind:(NSString *)kind def:(NSString *)def options:(NSArray<NSArray<NSString *> *> *)options onVal:(NSString *)onVal offVal:(NSString *)offVal {
+              NSString *now = [self currentSettingValue:env def:def];
+              if ([kind isEqualToString:@"toggle"]) {
+                  NSString *onV = onVal.length ? onVal : @"1", *offV = offVal.length ? offVal : @"0";
+                  BOOL isOn = [now isEqualToString:onV];
+                  UIAction *act = [UIAction actionWithTitle:label image:nil identifier:nil handler:^(__kindof UIAction *a) {
+                      (void)a;
+                      dm_apply_setting_live(env.UTF8String, (isOn ? offV : onV).UTF8String);
+                  }];
+                  act.state = isOn ? UIMenuElementStateOn : UIMenuElementStateOff;
+                  return act;
+              }
+              NSMutableArray<UIAction *> *acts = [NSMutableArray array];
+              NSString *curTitle = now;
+              for (NSArray<NSString *> *opt in options) {
+                  if (opt.count < 2) continue;
+                  NSString *v = opt[0], *t = opt[1];
+                  BOOL sel = [v isEqualToString:now] || (v.doubleValue > 0 && fabs(v.doubleValue - now.doubleValue) < 1e-4);
+                  if (sel) curTitle = t;
+                  UIAction *act = [UIAction actionWithTitle:t image:nil identifier:nil handler:^(__kindof UIAction *a) {
+                      (void)a;
+                      dm_apply_setting_live(env.UTF8String, v.UTF8String);
+                  }];
+                  act.state = sel ? UIMenuElementStateOn : UIMenuElementStateOff;
+                  [acts addObject:act];
+              }
+              return [UIMenu menuWithTitle:[NSString stringWithFormat:@"%@ (%@)", label, curTitle] image:nil identifier:nil options:UIMenuOptionsSingleSelection children:acts];
+          }
+          - (NSArray<UIMenuElement *> *)buildTopMenuElements {
+              __weak DmGamepad *weakSelf = self;
+              int curL = _tap ? 2 : _full ? 1 : 0;
+              NSArray<NSString *> *lNames = @[
+                  @"2D Controls (Simple)",
+                  @"3D Controls (Full)",
+                  @"Tap (Touchscreen)"
+              ];
+              NSMutableArray<UIAction *> *lActs = [NSMutableArray array];
+              for (int l = 0; l < 3; l++) {
+                  if (l == 2 && dm_opmode() != 0) continue;
+                  UIAction *a = [UIAction actionWithTitle:lNames[l] image:nil identifier:nil handler:^(__kindof UIAction *act) {
+                      (void)act; [weakSelf setPadLayoutMode:l];
+                  }];
+                  a.state = (curL == l) ? UIMenuElementStateOn : UIMenuElementStateOff;
+                  [lActs addObject:a];
+              }
+              UIMenu *layoutInline = [UIMenu menuWithTitle:@"Control Mode" image:nil identifier:nil options:(UIMenuOptionsDisplayInline | UIMenuOptionsSingleSelection) children:lActs];
 
-          # Skip the pre-game Start Menu screen (Launcher.swift) by default so the game starts
-          # immediately when opening the IPA, while keeping all saved choices and exposing
-          # all settings directly in the in-game top-center "⋯" menu (GameMenu.swift).
-          # Also force 100% English UI on widmonstertony/nxnative (which hardcoded Chinese in LauncherText).
-          launcher_settings_swift = Path("dm/ios/Sources/LauncherSettings.swift")
-          if launcher_settings_swift.is_file():
-              txt = launcher_settings_swift.read_text(encoding="utf-8")
-              txt = txt.replace("return chinese(source)", "return source")
-              launcher_settings_swift.write_text(txt, encoding="utf-8")
+              NSArray<NSArray<NSString *> *> *aspectOpts = @[
+                  @[@"16:9", @"16:9 (Default Widescreen)"],
+                  @[@"fill", @"Fill Screen (Full iPad Display)"],
+                  @[@"16:10", @"16:10 (Widescreen)"],
+                  @[@"4:3", @"4:3 (Retro / Classic)"],
+                  @[@"21:9", @"21:9 (Ultrawide)"]
+              ];
+              UIMenuElement *aspectMenu = [self menuRowForEnv:@"DM_ASPECT_MODE" label:@"Aspect Ratio" kind:@"choice" def:@"16:9" options:aspectOpts onVal:nil offVal:nil];
 
-          launcher_swift = Path("dm/ios/Sources/Launcher.swift")
-          if launcher_swift.is_file():
-              txt = launcher_swift.read_text(encoding="utf-8")
-              txt = (
-                  txt.replace(
-                      'if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0"',
-                      'if ProcessInfo.processInfo.environment["DM_LAUNCHER"] != "1"',
-                  )
-                  .replace('"iCloud 存档"', '"iCloud Saves"')
-                  .replace('"自动同步"', '"Auto Sync"')
-                  .replace('"各设备使用同一 iCloud 账号。进入游戏时读取存档，保存后自动同步。"', '"Uses the same iCloud account across devices. Syncs automatically on launch and save."')
-                  .replace('"云存档"', '"Cloud saves"')
-                  .replace('"关闭"', '"Off"')
-                  .replace('"选择 iCloud 云盘文件夹…"', '"Choose a folder in iCloud Drive…"')
-                  .replace('"选择其他文件夹…"', '"Choose a different folder…"')
-                  .replace('"已保存。开始游戏后将使用此文件夹。"', '"Saved. The game uses this folder when you press Play."')
-                  .replace('"无法保存此文件夹，请选择其他文件夹。"', '"That folder could not be remembered — try a different one."')
-                  .replace('"关闭云存档"', '"Turn off cloud saves"')
-                  .replace('"请选择 iCloud 云盘文件夹，并在 Mac 端选择同一文件夹。游戏启动时读取云存档，保存后同步；被替换的存档保留在 save-backups 中。"', '"Choose a folder in iCloud Drive. Saves sync on start and after each save; replaced saves are kept in save-backups."')
-                  .replace('"之前选择的文件夹已无法读取（应用签名已改变），请重新选择。"', '"The folder you chose before is no longer readable. Please choose it again."')
-              )
-              launcher_swift.write_text(txt, encoding="utf-8")
+              NSMutableArray<UIMenuElement *> *gameRows = [NSMutableArray arrayWithObject:aspectMenu];
+              NSMutableArray<UIMenuElement *> *ctrlRows = [NSMutableArray array];
+              NSMutableArray<UIMenuElement *> *perfRows = [NSMutableArray array];
+              NSMutableSet<NSString *> *seen = [NSMutableSet setWithObject:@"DM_ASPECT_MODE"];
 
-          if gamepad_m.is_file():
-              txt = gamepad_m.read_text(encoding="utf-8")
+              NSURL *jsonURL = [NSBundle.mainBundle.resourceURL URLByAppendingPathComponent:@"dm/launcher.json"];
+              NSData *data = jsonURL ? [NSData dataWithContentsOfURL:jsonURL] : nil;
+              NSDictionary *json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+              NSArray *settings = [json[@"settings"] isKindOfClass:NSArray.class] ? json[@"settings"] : @[];
+
+              for (NSDictionary *s in settings) {
+                  if (![s isKindOfClass:NSDictionary.class]) continue;
+                  NSString *env = s[@"env"], *kind = s[@"kind"], *label = s[@"label"], *def = s[@"default"] ?: @"";
+                  NSString *sec = s[@"section"] ?: @"Game";
+                  if (!env.length || !kind.length || !label.length || [seen containsObject:env]) continue;
+                  [seen addObject:env];
+                  UIMenuElement *el = nil;
+                  if ([kind isEqualToString:@"toggle"]) {
+                      NSString *onV = s[@"on"] ?: @"1", *offV = s[@"off"] ?: @"0";
+                      el = [self menuRowForEnv:env label:label kind:@"toggle" def:def options:nil onVal:onV offVal:offV];
+                  } else if ([kind isEqualToString:@"choice"]) {
+                      NSArray *opts = [s[@"options"] isKindOfClass:NSArray.class] ? s[@"options"] : @[];
+                      el = [self menuRowForEnv:env label:label kind:@"choice" def:def options:opts onVal:nil offVal:nil];
+                  } else if ([kind isEqualToString:@"range"]) {
+                      double lo = [s[@"min"] doubleValue], hi = [s[@"max"] doubleValue], st = [s[@"step"] doubleValue];
+                      if (st <= 0) st = 0.1;
+                      NSMutableArray<NSArray<NSString *> *> *rOpts = [NSMutableArray array];
+                      for (double v = lo; v <= hi + 1e-6; v += st) {
+                          int pct = (int)llround(v * 100.0);
+                          if ([env isEqualToString:@"DM_RENDER_SCALE"] && (pct % 10 != 0 && pct != 75)) continue;
+                          if ([env isEqualToString:@"DM_RUMBLE_GAIN"] && (pct % 50 != 0)) continue;
+                          [rOpts addObject:@[[NSString stringWithFormat:@"%g", v], [NSString stringWithFormat:@"%d%%", pct]]];
+                      }
+                      el = [self menuRowForEnv:env label:label kind:@"choice" def:def options:rOpts onVal:nil offVal:nil];
+                  }
+                  if (!el) continue;
+                  if ([sec isEqualToString:@"Controls"]) [ctrlRows addObject:el];
+                  else if ([sec isEqualToString:@"Performance"]) [perfRows addObject:el];
+                  else [gameRows addObject:el];
+              }
+
+              NSMutableArray<UIMenuElement *> *menus = [NSMutableArray array];
+              [menus addObject:layoutInline];
+              if (gameRows.count) [menus addObject:[UIMenu menuWithTitle:@"Game Settings" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:gameRows]];
+              if (ctrlRows.count) [menus addObject:[UIMenu menuWithTitle:@"Controls" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:ctrlRows]];
+              if (perfRows.count) [menus addObject:[UIMenu menuWithTitle:@"Performance" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:perfRows]];
+
+              UIAction *openSheet = [UIAction actionWithTitle:@"Start Menu & Cloud Saves…" image:[UIImage systemImageNamed:@"slider.horizontal.3"] identifier:nil handler:^(__kindof UIAction *a) {
+                  (void)a; dm_open_settings_sheet();
+              }];
+              [menus addObject:[UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:@[openSheet]]];
+              return menus;
+          }
+          - (UIMenu *)buildTopNativeMenu {
+              __weak DmGamepad *weakSelf = self;
+              UIDeferredMenuElement *deferred = [UIDeferredMenuElement elementWithUncachedProvider:^(void (^completion)(NSArray<UIMenuElement *> *)) {
+                  completion(weakSelf ? [weakSelf buildTopMenuElements] : @[]);
+              }];
+              return [UIMenu menuWithTitle:@"" children:@[deferred]];
+          }
+          - (void)nextLayout {"""
+                      txt = txt.replace("- (void)nextLayout {", ipad_menu_methods, 1)
               txt = (
                   txt.replace('@"奔跑"', '@"Run"')
                   .replace('@"瞄准"', '@"Aim"')
@@ -965,15 +1358,120 @@ jobs:
               )
               gamepad_m.write_text(txt, encoding="utf-8")
 
+          # 7. Patch Swift & ObjC UI files for instant boot, in-game menu, saved settings preload, and 100% English UI
+          launcher_settings_swift = Path("dm/ios/Sources/LauncherSettings.swift")
+          if launcher_settings_swift.is_file():
+              txt = launcher_settings_swift.read_text(encoding="utf-8")
+              txt = re.sub(
+                  r"static let simplifiedChinese: \[String: String\] = \[.*?\]",
+                  "static let simplifiedChinese: [String: String] = [:]",
+                  txt,
+                  flags=re.S,
+              ).replace("return chinese(source)", "return source").replace(
+                  'fixed = fromLaunch.union((env["DM_ENV_FILE_KEYS"] ?? "").split(separator: " ").map(String.init))',
+                  "fixed = []",
+              )
+              launcher_settings_swift.write_text(txt, encoding="utf-8")
+
+          launcher_swift = Path("dm/ios/Sources/Launcher.swift")
+          if launcher_swift.is_file():
+              txt = launcher_swift.read_text(encoding="utf-8")
+              for k, v in [
+                  ('if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0"', 'if ProcessInfo.processInfo.environment["DM_LAUNCHER"] != "1"'),
+                  ('"iCloud 存档"', '"iCloud Saves"'),
+                  ('"自动同步"', '"Auto Sync"'),
+                  ('"各设备使用同一 iCloud 账号。进入游戏时读取存档，保存后自动同步。"', '"Uses the same iCloud account across devices. Syncs automatically on launch and save."'),
+                  ('"云存档"', '"Cloud saves"'),
+                  ('/// 云存档:', '/// Cloud saves:'),
+                  ('/// 云存档 too).', '/// Cloud saves too).'),
+                  ('"关闭"', '"Off"'),
+                  ('"选择 iCloud 云盘文件夹…"', '"Choose a folder in iCloud Drive…"'),
+                  ('"选择其他文件夹…"', '"Choose a different folder…"'),
+                  ('"已保存。开始游戏后将使用此文件夹。"', '"Saved. The game uses this folder when you press Play."'),
+                  ('"无法保存此文件夹，请选择其他文件夹。"', '"That folder could not be remembered — try a different one."'),
+                  ('"关闭云存档"', '"Turn off cloud saves"'),
+                  ('"请选择 iCloud 云盘文件夹，并在 Mac 端选择同一文件夹。游戏启动时读取云存档，保存后同步；被替换的存档保留在 save-backups 中。"', '"Choose a folder in iCloud Drive. Saves sync on start and after each save; replaced saves are kept in save-backups."'),
+                  ('"之前选择的文件夹已无法读取（应用签名已改变），请重新选择。"', '"The folder you chose before is no longer readable. Please choose it again."'),
+                  ('Locale(identifier: "zh_Hans_CN")', 'Locale(identifier: "en_GB")'),
+              ]:
+                  txt = txt.replace(k, v)
+              launcher_swift.write_text(txt, encoding="utf-8")
+
+          main_m = Path("dm/ios/Sources/main.m")
+          if main_m.is_file():
+              txt = main_m.read_text(encoding="utf-8")
+              for k, v in [
+                  ('@"卡带暂时无法启动"', '@"Cannot Start Game"'),
+                  ('@"请检查该游戏的资源是否已完整移入游戏匣。"', '@"Please check that the game files are complete."'),
+                  ('@"游戏自带引擎未能启动。"', '@"The game engine failed to start."'),
+                  ('@"好"', '@"OK"'),
+              ]:
+                  txt = txt.replace(k, v)
+              if "launcher." not in txt:
+                  txt = txt.replace(
+                      "front_hud_env();",
+                      'NSDictionary<NSString *, id> *defs = [NSUserDefaults.standardUserDefaults dictionaryRepresentation];\n'
+                      '    for (NSString *dk in defs) if ([dk hasPrefix:@"launcher."] && [defs[dk] isKindOfClass:NSString.class]) {\n'
+                      '        NSString *ek = [dk substringFromIndex:9], *ev = defs[dk];\n'
+                      '        if (ek.length && ev.length) setenv(ek.UTF8String, ev.UTF8String, 1);\n'
+                      '    }\n'
+                      "    front_hud_env();",
+                      1,
+                  )
+              main_m.write_text(txt, encoding="utf-8")
+
+          game_menu_h = Path("dm/ios/Sources/DmGameMenu.h")
+          if game_menu_h.is_file():
+              txt = game_menu_h.read_text(encoding="utf-8")
+              if "dm_open_settings_sheet" not in txt:
+                  game_menu_h.write_text(
+                      txt.replace("void *dm_game_menu(void);", "void *dm_game_menu(void);\nvoid dm_open_settings_sheet(void);"),
+                      encoding="utf-8",
+                  )
+
           game_menu_swift = Path("dm/ios/Sources/GameMenu.swift")
           if game_menu_swift.is_file():
               txt = game_menu_swift.read_text(encoding="utf-8")
-              txt = txt.replace(
-                  'let title = gameMenuModel != nil ? "More settings on the start screen" : ""',
-                  'let title = ""',
-              ).replace(
-                  'where (s.kind == "choice" || s.kind == "toggle") && dm_setting_live(s.env, nil)',
-                  'where (s.kind == "choice" || s.kind == "toggle")',
+              txt = (
+                  txt.replace('let title = gameMenuModel != nil ? "More settings on the start screen" : ""', 'let title = ""')
+                  .replace(
+                      '    let names = ["2D", "3D", "Tap"]\n'
+                      "    let layouts = (0..<3).filter { dm_pad_layout_offered(Int32($0)) }.map { l in\n"
+                      "        UIAction(title: names[l], state: dm_pad_layout() == l ? .on : .off) { _ in dm_pad_layout_set(Int32(l)) }\n"
+                      "    }\n"
+                      '    let layout = UIMenu(title: "Controller layout", options: .singleSelection, children: layouts)',
+                      '    let names = ["2D Controls (Simple)", "3D Controls (Full)", "Tap (Touchscreen)"]\n'
+                      "    let layouts = (0..<3).filter { dm_pad_layout_offered(Int32($0)) }.map { l in\n"
+                      "        UIAction(title: names[l], state: dm_pad_layout() == l ? .on : .off) { _ in dm_pad_layout_set(Int32(l)) }\n"
+                      "    }\n"
+                      '    let layout = UIMenu(title: "Control Mode", options: [.displayInline, .singleSelection], children: layouts)',
+                  )
+                  .replace('var rows: [UIMenuElement] = section == "Controls" ? [layout] : []', "var rows: [UIMenuElement] = []")
+                  .replace("if section == \"Controls\" { placed = true }", "")
+                  .replace("if !placed { items.insert(UIMenu(options: .displayInline, children: [layout]), at: 0) }", "items.insert(layout, at: 0)")
+                  .replace('where (s.kind == "choice" || s.kind == "toggle") && dm_setting_live(s.env, nil)', 'where (s.kind == "choice" || s.kind == "toggle" || s.kind == "range")')
+                  .replace(
+                      "    let options = s.options ?? []",
+                      '    if s.kind == "range" {\n'
+                      "        let lo = s.min ?? 0.5, hi = s.max ?? 1.0, st = (s.step ?? 0.05) > 0 ? (s.step ?? 0.05) : 0.05\n"
+                      "        var rActs: [UIAction] = []\n"
+                      "        var v = lo\n"
+                      "        while v <= hi + 1e-6 {\n"
+                      "            let pct = Int((v * 100).rounded())\n"
+                      '            let vStr = String(format: "%g", v)\n'
+                      "            let sel = abs((Double(now) ?? -1) - v) < 1e-4\n"
+                      '            rActs.append(UIAction(title: "\\(pct)%", attributes: attributes, state: sel ? .on : .off) { _ in pick(vStr) })\n'
+                      "            v += st\n"
+                      "        }\n"
+                      "        return UIMenu(title: s.label, options: .singleSelection, children: rActs)\n"
+                      "    }\n"
+                      "    let options = s.options ?? []",
+                  )
+                  .replace(
+                      "    return items\n}",
+                      '    items.append(UIMenu(options: .displayInline, children: [UIAction(title: "Start Menu & Cloud Saves…", image: UIImage(systemName: "slider.horizontal.3")) { _ in dm_open_settings_sheet() }]))\n'
+                      "    return items\n}",
+                  )
               )
               game_menu_swift.write_text(txt, encoding="utf-8")
           PY
@@ -1438,3 +1936,4 @@ jobs:
           rm -rf \
             "$RUNNER_TEMP/nxnative" \
             "$RUNNER_TEMP/GameFiles"
+
