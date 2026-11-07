@@ -700,6 +700,15 @@ jobs:
           gamepad_m = Path("dm/ios/Sources/DmGamepad.m")
           has_touch_geo = gamepad_m.is_file() and "DmPadGeometry.h" in gamepad_m.read_text(encoding="utf-8", errors="replace")
 
+          # Fix upstream typo in widmonstertony/nxnative legacy renderer (nvn_mtl_legacy.inc:4733)
+          # where TONTON_SHADER_CHAIN was left unrenamed after DMSH_CHAIN migration.
+          legacy_inc = Path("dm/gfx/nvn/nvn_mtl_legacy.inc")
+          if legacy_inc.is_file():
+              txt = legacy_inc.read_text(encoding="utf-8")
+              if "TONTON_SHADER_CHAIN" in txt:
+                  txt = txt.replace("TONTON_SHADER_CHAIN", "DMSH_CHAIN")
+                  legacy_inc.write_text(txt, encoding="utf-8")
+
           game_py = Path("dm/games/game.py")
           if game_py.is_file():
               txt = game_py.read_text(encoding="utf-8")
@@ -800,12 +809,17 @@ jobs:
           front_ios_m = Path("dm/ios/Sources/front_ios.m")
           if front_ios_m.is_file():
               txt = front_ios_m.read_text(encoding="utf-8")
-              if "front_screen_max_fps" not in txt:
+              if 'getenv("DM_RENDER_SCALE")' not in txt:
                   txt = txt.replace(
                       "if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));",
                       "if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));\n"
                       '    const char *rs = getenv("DM_RENDER_SCALE"); if (rs && *rs) { float rsf = strtof(rs, NULL); if (rsf >= 0.5f && rsf < 1.0f) scale *= rsf; }',
+                  ).replace(
+                      "l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);",
+                      'CGFloat scale = l.contentsScale; const char *rs = getenv("DM_RENDER_SCALE"); if (rs && *rs) { float rsf = strtof(rs, NULL); if (rsf >= 0.5f && rsf < 1.0f) scale *= rsf; }\n'
+                      "    l.drawableSize = CGSizeMake(self.bounds.size.width * scale, self.bounds.size.height * scale);",
                   )
+              if "front_screen_max_fps" not in txt:
                   txt = txt.replace(
                       "bool dm_setting_live(const char *env, const char *value) {",
                       "int front_screen_max_fps(void) { return (int)UIScreen.mainScreen.maximumFramesPerSecond; }\n"
@@ -816,7 +830,7 @@ jobs:
                       "        return true;\n"
                       "    }",
                   )
-                  front_ios_m.write_text(txt, encoding="utf-8")
+              front_ios_m.write_text(txt, encoding="utf-8")
 
           if gamepad_m.is_file():
               txt = gamepad_m.read_text(encoding="utf-8")
