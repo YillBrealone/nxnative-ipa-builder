@@ -709,6 +709,38 @@ jobs:
                   txt = txt.replace("TONTON_SHADER_CHAIN", "DMSH_CHAIN")
                   legacy_inc.write_text(txt, encoding="utf-8")
 
+          # Set default game language to UK English (en-GB) while keeping the Start Screen
+          # Game language picker unlocked and falling back cleanly if a title lacks en-GB.
+          build_nsp_py = Path("scripts/build_ipa_from_nsp.py")
+          if build_nsp_py.is_file():
+              txt = build_nsp_py.read_text(encoding="utf-8")
+              txt = txt.replace(
+                  "want_lang = language_code(lang_in) if lang_in else 'en-US'",
+                  "want_lang = language_code(lang_in) if lang_in else 'en-GB'",
+              )
+              build_nsp_py.write_text(txt, encoding="utf-8")
+
+          build_ipa_sh = Path("dm/ios/tools/build_ipa.sh")
+          if build_ipa_sh.is_file():
+              txt = build_ipa_sh.read_text(encoding="utf-8")
+              txt = txt.replace(
+                  "export DM_LANG=${DM_LANG:-en-US}",
+                  "export DM_LANG=${DM_LANG:-en-GB}",
+              )
+              build_ipa_sh.write_text(txt, encoding="utf-8")
+
+          hle_oe_c = Path("dm/host/hle_oe.c")
+          if hle_oe_c.is_file():
+              txt = hle_oe_c.read_text(encoding="utf-8")
+              txt = txt.replace(
+                  'strncpy(code, e && *e ? e : "en-US", sizeof code - 1);',
+                  'strncpy(code, e && *e ? e : "en-GB", sizeof code - 1);',
+              ).replace(
+                  'const char *e = getenv("DM_LANG"); if (!e || !*e) e = "en-US";',
+                  'const char *e = getenv("DM_LANG"); if (!e || !*e) e = "en-GB";',
+              )
+              hle_oe_c.write_text(txt, encoding="utf-8")
+
           game_py = Path("dm/games/game.py")
           if game_py.is_file():
               txt = game_py.read_text(encoding="utf-8")
@@ -887,6 +919,63 @@ jobs:
                       1,
                   )
                   gamepad_m.write_text(txt, encoding="utf-8")
+
+          # Skip the pre-game Start Menu screen (Launcher.swift) by default so the game starts
+          # immediately when opening the IPA, while keeping all saved choices and exposing
+          # all settings directly in the in-game top-center "⋯" menu (GameMenu.swift).
+          # Also force 100% English UI on widmonstertony/nxnative (which hardcoded Chinese in LauncherText).
+          launcher_settings_swift = Path("dm/ios/Sources/LauncherSettings.swift")
+          if launcher_settings_swift.is_file():
+              txt = launcher_settings_swift.read_text(encoding="utf-8")
+              txt = txt.replace("return chinese(source)", "return source")
+              launcher_settings_swift.write_text(txt, encoding="utf-8")
+
+          launcher_swift = Path("dm/ios/Sources/Launcher.swift")
+          if launcher_swift.is_file():
+              txt = launcher_swift.read_text(encoding="utf-8")
+              txt = (
+                  txt.replace(
+                      'if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0"',
+                      'if ProcessInfo.processInfo.environment["DM_LAUNCHER"] != "1"',
+                  )
+                  .replace('"iCloud 存档"', '"iCloud Saves"')
+                  .replace('"自动同步"', '"Auto Sync"')
+                  .replace('"各设备使用同一 iCloud 账号。进入游戏时读取存档，保存后自动同步。"', '"Uses the same iCloud account across devices. Syncs automatically on launch and save."')
+                  .replace('"云存档"', '"Cloud saves"')
+                  .replace('"关闭"', '"Off"')
+                  .replace('"选择 iCloud 云盘文件夹…"', '"Choose a folder in iCloud Drive…"')
+                  .replace('"选择其他文件夹…"', '"Choose a different folder…"')
+                  .replace('"已保存。开始游戏后将使用此文件夹。"', '"Saved. The game uses this folder when you press Play."')
+                  .replace('"无法保存此文件夹，请选择其他文件夹。"', '"That folder could not be remembered — try a different one."')
+                  .replace('"关闭云存档"', '"Turn off cloud saves"')
+                  .replace('"请选择 iCloud 云盘文件夹，并在 Mac 端选择同一文件夹。游戏启动时读取云存档，保存后同步；被替换的存档保留在 save-backups 中。"', '"Choose a folder in iCloud Drive. Saves sync on start and after each save; replaced saves are kept in save-backups."')
+                  .replace('"之前选择的文件夹已无法读取（应用签名已改变），请重新选择。"', '"The folder you chose before is no longer readable. Please choose it again."')
+              )
+              launcher_swift.write_text(txt, encoding="utf-8")
+
+          if gamepad_m.is_file():
+              txt = gamepad_m.read_text(encoding="utf-8")
+              txt = (
+                  txt.replace('@"奔跑"', '@"Run"')
+                  .replace('@"瞄准"', '@"Aim"')
+                  .replace('@"投掷"', '@"Throw"')
+                  .replace('@"已锁油门"', '@"Gas ON"')
+                  .replace('@"油门锁"', '@"Gas"')
+                  .replace('@"刹车"', '@"Brake"')
+              )
+              gamepad_m.write_text(txt, encoding="utf-8")
+
+          game_menu_swift = Path("dm/ios/Sources/GameMenu.swift")
+          if game_menu_swift.is_file():
+              txt = game_menu_swift.read_text(encoding="utf-8")
+              txt = txt.replace(
+                  'let title = gameMenuModel != nil ? "More settings on the start screen" : ""',
+                  'let title = ""',
+              ).replace(
+                  'where (s.kind == "choice" || s.kind == "toggle") && dm_setting_live(s.env, nil)',
+                  'where (s.kind == "choice" || s.kind == "toggle")',
+              )
+              game_menu_swift.write_text(txt, encoding="utf-8")
           PY
 
           DETECTED_ID="$(python - "$GAME_DIR" <<'PY'
