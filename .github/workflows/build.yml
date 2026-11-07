@@ -735,11 +735,13 @@ jobs:
                   )
               )
               if "g_ext_ev_val" not in txt:
+                  marker = "static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts, double queued_at) {"
+                  assert txt.count(marker) == 1, "Legacy present function changed; cannot install event declarations safely"
                   txt = txt.replace(
-                      "typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; } pq_item;",
-                      "typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; } pq_item;\n"
+                      marker,
                       "static __strong id<MTLSharedEvent> g_ext_ev;\n"
-                      "static _Atomic uint64_t g_ext_ev_val;",
+                      "static _Atomic uint64_t g_ext_ev_val;\n" + marker,
+                      1,
                   ).replace(
                       "    id<MTLCommandBuffer> cb = [g_q commandBuffer];\n    if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { return 0; }",
                       "    id<MTLCommandBuffer> cb = [g_q commandBuffer];\n"
