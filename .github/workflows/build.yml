@@ -1192,7 +1192,7 @@ jobs:
           # Device-specific renderer & pipeline archive settings
           if [[ "$DEVICE_INPUT" == *"BC fallback"* ]]; then
             export DM_IOS_RENDERER=legacy
-            export DM_LEGACY_TARGET=a10x
+            export DM_LEGACY_TARGET=m2
             if grep -q -- "--gpu" <<<"$HELP_TEXT"; then
               BUILD_ARGS+=(--gpu none)
             fi
