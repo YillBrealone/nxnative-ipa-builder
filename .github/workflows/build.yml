@@ -1612,6 +1612,100 @@ jobs:
               game_menu_swift.write_text(txt, encoding="utf-8")
           PY
 
+          # Add an opt-in relative trackpad without changing normal touchscreen input.
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(t, old, new, label):
+              n=t.count(old)
+              if n != 1: raise RuntimeError(f'{label}: expected one marker, found {n}')
+              return t.replace(old,new,1)
+
+          p=Path('dm/ios/Sources/DmGamepad.m')
+          assert p.is_file(), 'Trackpad: DmGamepad.m is missing'
+          t=p.read_text()
+          legacy='- (void)setPadLayoutMode:(int)l {' in t
+          swift=Path('dm/ios/Sources/GameMenu.swift')
+          assert legacy != swift.is_file(), 'Trackpad: unsupported menu variant'
+          t=replace_once(t, 'BOOL _full, _tap;', 'BOOL _full, _tap, _trackpad;\n    UITouch *_trackFinger; CGPoint _trackStart, _trackLast; NSTimeInterval _trackStartTime, _trackLastTime;\n    BOOL _trackDragged, _trackClick; int32_t _trackX, _trackY; NSUInteger _trackMoveEpoch, _trackClickEpoch;', 'ivars')
+          # Keep Tap and Trackpad both visually minimal but preserve separate state and preference.
+          t=t.replace('_full = l == 1; _tap = l == 2;', '_full = l == 1; _trackpad = l == 3; _tap = l == 2 || _trackpad;')
+          assert t.count('_trackpad = l == 3;') >= 2, 'Trackpad: layout assignments changed'
+          t=t.replace('if (l == 2 && dm_opmode() != 0)', 'if ((l == 2 || l == 3) && dm_opmode() != 0)')
+          if legacy:
+              t=replace_once(t, 'int curL = _tap ? 2 : _full ? 1 : 0;', 'int curL = _trackpad ? 3 : _tap ? 2 : _full ? 1 : 0;', 'legacy menu selection')
+              t=replace_once(t, '@"Tap (Touchscreen)"\n    ];', '@"Tap (Touchscreen)",\n        @"Trackpad (Drag & Tap)"\n    ];', 'legacy menu labels')
+              t=replace_once(t, 'for (int l = 0; l < 3; l++) {', 'for (int l = 0; l < 4; l++) {', 'legacy menu count')
+              # Legacy explicit setPadLayoutMode has return, not l=0.
+              t=t.replace('if (l == 2 && dm_opmode() != 0) return;', 'if ((l == 2 || l == 3) && dm_opmode() != 0) return;')
+              t=t.replace('if (l == 2 && dm_opmode() != 0) a.attributes', 'if ((l == 2 || l == 3) && dm_opmode() != 0) a.attributes')
+          else:
+              t=replace_once(t, '- (int)padLayout { return _tap ? 2 : _full ? 1 : 0; }', '- (int)padLayout { return _trackpad ? 3 : _tap ? 2 : _full ? 1 : 0; }', 'modern selected layout')
+              t=replace_once(t, '_tap = NO; _full = NO; [self applyLayout]', '_tap = NO; _trackpad = NO; _full = NO; [self applyLayout]', 'docked reset')
+              t=replace_once(t, 'layout == 0 || layout == 1 || (layout == 2 && dm_opmode() == 0)', 'layout == 0 || layout == 1 || ((layout == 2 || layout == 3) && dm_opmode() == 0)', 'modern offered layouts')
+              s=swift.read_text()
+              s=replace_once(s, 'let names = ["2D Controls (Simple)", "3D Controls (Full)", "Tap (Touchscreen)"]\n    let layouts = (0..<3).map', 'let names = ["2D Controls (Simple)", "3D Controls (Full)", "Tap (Touchscreen)", "Trackpad (Drag & Tap)"]\n    let layouts = (0..<4).map', 'swift menu')
+              swift.write_text(s)
+          # Inject at recompute after normal axis computation but before state snapshot.
+          marker='    BOOL changed = face != _faceBits'
+          assert t.count(marker)==1, 'Trackpad: recompute location changed'
+          t=t.replace(marker, '    if (_trackpad) { ax[0] = _trackX; ax[1] = _trackY; if (_trackClick) btn |= 1ull << B_A; }\n'+marker, 1)
+          # Release timed work even after a mode change, interruption or reset.
+          t=replace_once(t, '- (void)reset {', '- (void)reset { _trackFinger = nil; _trackX = _trackY = 0; _trackClick = NO; _trackDragged = NO; _trackMoveEpoch++; _trackClickEpoch++;', 'reset')
+          # Handle one finger only. No game touchscreen injection in this mode.
+          methods='''// Experimental relative trackpad: finger velocity drives the left stick; short taps pulse native A.
+          // This does not place the game cursor at an absolute coordinate.
+          - (void)trackBegin:(NSSet<UITouch *> *)touches {
+              if (_trackFinger) return;
+              for (UITouch *t in touches) {
+                  if (t.type != UITouchTypeDirect) continue;
+                  _trackFinger = t; _trackStart = _trackLast = [t locationInView:self];
+                  _trackStartTime = _trackLastTime = t.timestamp; _trackDragged = NO;
+                  _trackX = _trackY = 0; _trackMoveEpoch++; [self recompute]; break;
+              }
+          }
+          - (void)trackMove:(NSSet<UITouch *> *)touches {
+              UITouch *t = _trackFinger; if (!t || ![touches containsObject:t]) return;
+              CGPoint p = [t locationInView:self]; NSTimeInterval dt = t.timestamp - _trackLastTime;
+              if (hypot(p.x - _trackStart.x, p.y - _trackStart.y) > 10.0) _trackDragged = YES;
+              if (_trackDragged && dt > 0.0001) {
+                  // A 600-point/sec swipe reaches full stick; cap each axis to the host range.
+                  double x = (p.x - _trackLast.x) / dt / 600.0, y = -(p.y - _trackLast.y) / dt / 600.0;
+                  _trackX = (int32_t)lrint(fmax(-1.0, fmin(1.0, x)) * 32767.0);
+                  _trackY = (int32_t)lrint(fmax(-1.0, fmin(1.0, y)) * 32767.0);
+                  NSUInteger epoch = ++_trackMoveEpoch; __weak DmGamepad *weakSelf = self;
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                      DmGamepad *pad = weakSelf;
+                      if (!pad || pad->_trackMoveEpoch != epoch) return;
+                      pad->_trackX = pad->_trackY = 0; [pad recompute];
+                  });
+                  [self recompute];
+              }
+              _trackLast = p; _trackLastTime = t.timestamp;
+          }
+          - (void)trackEnd:(NSSet<UITouch *> *)touches tapped:(BOOL)ended {
+              UITouch *t = _trackFinger; if (!t || ![touches containsObject:t]) return;
+              CGPoint p = [t locationInView:self];
+              BOOL click = ended && !_trackDragged && hypot(p.x - _trackStart.x, p.y - _trackStart.y) <= 10.0 && t.timestamp - _trackStartTime <= 0.45;
+              _trackFinger = nil; _trackX = _trackY = 0; _trackMoveEpoch++;
+              if (click) {
+                  _trackClick = YES; NSUInteger epoch = ++_trackClickEpoch; __weak DmGamepad *weakSelf = self;
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                      DmGamepad *pad = weakSelf;
+                      if (!pad || pad->_trackClickEpoch != epoch) return;
+                      pad->_trackClick = NO; [pad recompute];
+                  });
+              }
+              [self recompute];
+          }
+          '''
+          t=replace_once(t, '- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {', methods+'- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {\n    if (_trackpad) { [self trackBegin:ts]; return; }', 'begin')
+          t=replace_once(t, '- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {', '- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {\n    if (_trackpad) { [self trackMove:ts]; return; }', 'move')
+          t=replace_once(t, '- (void)endTouches:(NSSet<UITouch *> *)ts tapped:(BOOL)ended {', '- (void)endTouches:(NSSet<UITouch *> *)ts tapped:(BOOL)ended {\n    if (_trackpad) { [self trackEnd:ts tapped:ended]; return; }', 'end')
+          p.write_text(t)
+          print('Trackpad source patch applied:', 'legacy' if legacy else 'modern')
+          PY
+
           DETECTED_ID="$(python - "$GAME_DIR" <<'PY'
           import re
           import struct
@@ -1811,7 +1905,7 @@ jobs:
           swift = root / 'GameMenu.swift'
           target = swift if swift.is_file() else pad
           text = target.read_text(encoding='utf-8', errors='replace')
-          for required in ('2D Controls (Simple)', '3D Controls (Full)', 'Tap (Touchscreen)', 'Control Mode', 'Display', 'Controls', 'Performance', 'Other Settings', 'Next launch'):
+          for required in ('2D Controls (Simple)', '3D Controls (Full)', 'Tap (Touchscreen)', 'Trackpad (Drag & Tap)', 'Control Mode', 'Display', 'Controls', 'Performance', 'Other Settings', 'Next launch'):
               if required not in text:
                   raise SystemExit('Host UI check: expected control-menu labels or groups were not found; the engine source may have changed.')
           if swift.is_file() and 'dm_pad_layout_set' not in text:
