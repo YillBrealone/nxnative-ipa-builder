@@ -1351,7 +1351,7 @@ jobs:
                   a.state = (curL == l) ? UIMenuElementStateOn : UIMenuElementStateOff;
                   [lActs addObject:a];
               }
-              UIMenu *layoutInline = [UIMenu menuWithTitle:@"Control Mode" image:nil identifier:nil options:(UIMenuOptionsDisplayInline | UIMenuOptionsSingleSelection) children:lActs];
+              UIMenu *layoutInline = [UIMenu menuWithTitle:@"Control Mode" image:nil identifier:nil options:UIMenuOptionsSingleSelection children:lActs];
 
               NSArray<NSArray<NSString *> *> *aspectOpts = @[
                   @[@"16:9", @"16:9 (Default Widescreen)"],
@@ -1569,7 +1569,7 @@ jobs:
               let layouts = (0..<3).map { l in
                   UIAction(title: names[l], attributes: dm_pad_layout_offered(Int32(l)) ? [] : .disabled, state: dm_pad_layout() == l ? .on : .off) { _ in dm_pad_layout_set(Int32(l)) }
               }
-              let layout = UIMenu(title: "Control Mode", options: [.displayInline, .singleSelection], children: layouts)
+              let layout = UIMenu(title: "Control Mode", options: .singleSelection, children: layouts)
               let displayKeys: Set<String> = ["DM_ASPECT_MODE", "DM_RENDER_SCALE", "DM_DYNAMIC_RESOLUTION", "DM_PRESENT_UPSCALE", "DM_UPSCALER", "DM_PICTURE_FIT", "DM_SCREEN_ASPECT", "DM_FULLSCREEN"]
               let perfKeys: Set<String> = ["DM_FPS_TARGET", "DM_NFS_FPS", "DM_ARCEUS_FPS", "DM_FRAMEGEN", "DM_SHOW_FPS"]
               var display: [UIMenuElement] = [], controls: [UIMenuElement] = [], performance: [UIMenuElement] = [], other: [UIMenuElement] = []
