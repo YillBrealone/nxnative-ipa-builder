@@ -65,6 +65,8 @@ The workflow is designed to start games immediately, with Handheld and UK Englis
 
 ## If something goes wrong
 
+For more help, see the [troubleshooting guide](TROUBLESHOOTING.md).
+
 - **Download fails:** Check that the link is accessible to the runner and downloads the actual file or supported Google Drive folder.
 - **Keys error:** Check the `Keys_URL` secret in your own repository. Never share the keys or their link.
 - **Title ID error:** Make sure the base game is included. Leave `profile_id` blank for automatic detection unless you know the correct ID.
