@@ -1029,15 +1029,18 @@ jobs:
           if front_ios_m.is_file():
               txt = front_ios_m.read_text(encoding="utf-8")
               if 'getenv("DM_RENDER_SCALE")' not in txt:
-                  txt = txt.replace(
-                      "if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));",
-                      "if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));\n"
-                      '    const char *rs = getenv("DM_RENDER_SCALE"); if (rs && *rs) { float rsf = strtof(rs, NULL); if (rsf >= 0.5f && rsf < 1.0f) scale *= rsf; }',
-                  ).replace(
-                      "l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);",
-                      'CGFloat scale = l.contentsScale; const char *rs = getenv("DM_RENDER_SCALE"); if (rs && *rs) { float rsf = strtof(rs, NULL); if (rsf >= 0.5f && rsf < 1.0f) scale *= rsf; }\n'
-                      "    l.drawableSize = CGSizeMake(self.bounds.size.width * scale, self.bounds.size.height * scale);",
-                  )
+                  # These are alternative upstream layouts, not two independent patches:
+                  # some versions have both markers in the same method and already declare scale.
+                  capped_scale = "if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));"
+                  old_drawable = "l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);"
+                  if capped_scale in txt:
+                      assert txt.count(capped_scale) == 1, "Render scale: ambiguous capped-scale layout"
+                      txt = txt.replace(capped_scale, capped_scale + '\n    const char *dm_render_rs = getenv("DM_RENDER_SCALE"); if (dm_render_rs && *dm_render_rs) { float dm_render_rsf = strtof(dm_render_rs, NULL); if (dm_render_rsf >= 0.5f && dm_render_rsf < 1.0f) scale *= dm_render_rsf; }', 1)
+                  elif old_drawable in txt:
+                      assert txt.count(old_drawable) == 1, "Render scale: ambiguous drawable layout"
+                      txt = txt.replace(old_drawable, '{ CGFloat dm_render_scale = l.contentsScale; const char *dm_render_rs = getenv("DM_RENDER_SCALE"); if (dm_render_rs && *dm_render_rs) { float dm_render_rsf = strtof(dm_render_rs, NULL); if (dm_render_rsf >= 0.5f && dm_render_rsf < 1.0f) dm_render_scale *= dm_render_rsf; }\n    l.drawableSize = CGSizeMake(self.bounds.size.width * dm_render_scale, self.bounds.size.height * dm_render_scale); }', 1)
+                  else:
+                      raise RuntimeError('Render scale: unsupported front_ios.m layout')
               if "dm_aspect_rect" not in txt:
                   aspect_helper = """void dm_gamepad_live_reload(void);
           CGRect dm_aspect_rect(CGRect b) {
