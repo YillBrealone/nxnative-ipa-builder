@@ -1234,11 +1234,22 @@ jobs:
                       .replace("dm_pad_set_player(p, m,", "m = apply_pad_swap(m); dm_pad_set_player(p, m,", 1)
                       .replace("static void pads_start(void) {", "static void pads_start(void) {\n    update_pad_swap_mode();", 1)
                   )
-                  touch_reload = (
-                      '    const char *sz = getenv("DM_TOUCH_SIZE"); _opts.size = dm_pad_size_scale(sz);\n'
-                      '    const char *st = getenv("DM_TOUCH_STICK"); _opts.stick = dm_pad_stick_place(st);\n'
-                      "    _geoValid = NO;\n"
-                  ) if has_touch_geo else ""
+                  if has_touch_geo:
+                      # Match the engine's DmPadOptions declaration and initialization.
+                      # Do not guess a member name: a wrong field otherwise fails much later in Xcode.
+                      assert pad_geom_h.is_file(), "Touch geometry header is missing"
+                      geom = pad_geom_h.read_text(encoding="utf-8")
+                      opts = re.search(r'typedef\s+struct\s*\{([^{}]*)\}\s*DmPadOptions\s*;', geom, re.S)
+                      assert opts and re.search(r'\bCGFloat\s+scale\s*;', opts.group(1)) and re.search(r'\bint\s+stick\s*;', opts.group(1)), "DmPadOptions fields changed; review live touch settings"
+                      assert re.search(r'_opts\.scale\s*=\s*dm_pad_size_scale\s*\(', txt), "Touch size initialization changed; review live touch settings"
+                      assert re.search(r'_opts\.stick\s*=\s*dm_pad_stick_place\s*\(', txt), "Touch stick initialization changed; review live touch settings"
+                      touch_reload = (
+                          '    const char *sz = getenv("DM_TOUCH_SIZE"); _opts.scale = dm_pad_size_scale(sz);\n'
+                          '    const char *st = getenv("DM_TOUCH_STICK"); _opts.stick = dm_pad_stick_place(st);\n'
+                          "    _geoValid = NO;\n"
+                      )
+                  else:
+                      touch_reload = ""
                   pad_notify_sel = "inputDevicesChanged" if "inputDevicesChanged:" in txt else "padsChanged"
                   live_method = (
                       "- (void)reloadLiveOptions {\n"
