@@ -1699,9 +1699,17 @@ jobs:
               [self recompute];
           }
           '''
-          t=replace_once(t, '- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {', methods+'- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {\n    if (_trackpad) { [self trackBegin:ts]; return; }', 'begin')
-          t=replace_once(t, '- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {', '- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {\n    if (_trackpad) { [self trackMove:ts]; return; }', 'move')
-          t=replace_once(t, '- (void)endTouches:(NSSet<UITouch *> *)ts tapped:(BOOL)ended {', '- (void)endTouches:(NSSet<UITouch *> *)ts tapped:(BOOL)ended {\n    if (_trackpad) { [self trackEnd:ts tapped:ended]; return; }', 'end')
+          # Other classes (such as DmMenuButton) may implement touchesBegan too.
+          # Patch only DmGamepad, and retain strict uniqueness checks inside it.
+          class_marker = '@implementation DmGamepad {'
+          if t.count(class_marker) != 1: raise RuntimeError('Trackpad: expected one DmGamepad implementation')
+          prefix, body = t.split(class_marker, 1)
+          if '@end' not in body: raise RuntimeError('Trackpad: DmGamepad implementation is unterminated')
+          body, suffix = body.split('@end', 1)
+          body=replace_once(body, '- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {', methods+'- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {\n    if (_trackpad) { [self trackBegin:ts]; return; }', 'begin')
+          body=replace_once(body, '- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {', '- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {\n    if (_trackpad) { [self trackMove:ts]; return; }', 'move')
+          body=replace_once(body, '- (void)endTouches:(NSSet<UITouch *> *)ts tapped:(BOOL)ended {', '- (void)endTouches:(NSSet<UITouch *> *)ts tapped:(BOOL)ended {\n    if (_trackpad) { [self trackEnd:ts tapped:ended]; return; }', 'end')
+          t = prefix + class_marker + body + '@end' + suffix
           p.write_text(t)
           print('Trackpad source patch applied:', 'legacy' if legacy else 'modern')
           PY
